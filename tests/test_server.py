@@ -12,6 +12,9 @@ from karaokeizer.serve_karaoke import RangeRequestHandler
 @pytest.fixture
 def local_server(tmp_path):
     (tmp_path / "media.bin").write_bytes(b"0123456789")
+    ssli = tmp_path / "karaoke" / "ssli"
+    ssli.mkdir(parents=True)
+    (ssli / "index.html").write_text("SSLI", encoding="utf-8")
     handler = partial(RangeRequestHandler, directory=str(tmp_path))
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -36,6 +39,12 @@ def test_server_supports_ranges_and_security_headers(local_server):
         assert response.read() == b"2345"
         assert response.headers["X-Content-Type-Options"] == "nosniff"
         assert "connect-src 'none'" in response.headers["Content-Security-Policy"]
+        assert "frame-ancestors 'none'" in response.headers["Content-Security-Policy"]
+
+
+def test_server_allows_only_packaged_ssli_to_be_same_origin_framed(local_server):
+    with request(local_server, "/karaoke/ssli/index.html?exhibitHost=1") as response:
+        assert "frame-ancestors 'self'" in response.headers["Content-Security-Policy"]
 
 
 def test_server_rejects_bad_host_and_directory_listing(local_server):

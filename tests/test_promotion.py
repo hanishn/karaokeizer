@@ -256,3 +256,19 @@ def test_receipt_failure_restores_previous_canonical(tmp_path: Path, monkeypatch
 
     assert (canonical / "old").read_text(encoding="utf-8") == "old"
     assert not backup.exists()
+
+
+def test_receipt_parent_failure_restores_previous_canonical(tmp_path: Path):
+    canonical, backup = tmp_path / "canonical", tmp_path / "canonical.backup"
+    canonical.mkdir()
+    backup.mkdir()
+    (canonical / "new").write_text("new", encoding="utf-8")
+    (backup / "old").write_text("old", encoding="utf-8")
+    parent_is_file = tmp_path / "not-a-directory"
+    parent_is_file.write_text("occupied", encoding="utf-8")
+
+    with pytest.raises((FileExistsError, NotADirectoryError, OSError)):
+        write_receipt_or_rollback(parent_is_file / "receipt.json", {"pass": True}, canonical, backup)
+
+    assert (canonical / "old").read_text(encoding="utf-8") == "old"
+    assert not backup.exists()

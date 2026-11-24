@@ -43,11 +43,12 @@ class RangeRequestHandler(SimpleHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cache-Control", "no-store")
+        frame_ancestors = "'self'" if self.path.split("?", 1)[0].startswith("/karaoke/ssli/") else "'none'"
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data:; media-src 'self'; frame-src 'self'; connect-src 'none'; object-src 'none'; "
-            "base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+            f"base-uri 'none'; frame-ancestors {frame_ancestors}; form-action 'none'",
         )
         super().end_headers()
 

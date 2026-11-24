@@ -45,7 +45,7 @@ def test_explicit_instrumental_classification_suppresses_all_lyrics():
     assert "instrumental" in status.lower() or "reliable" in status.lower()
 
 
-def test_hum_uses_audio_context_scheduling_not_javascript_timers(tmp_path):
+def test_hum_uses_ssli_formant_scheduling_not_local_oscillators(tmp_path):
     album = {"config": {"album": "Album", "artist": "Artist"}}
     track = {
         "title": "Song", "audio": "media/song.flac", "segments": [], "words": [], "note_events": [],
@@ -56,7 +56,11 @@ def test_hum_uses_audio_context_scheduling_not_javascript_timers(tmp_path):
     }
 
     player = build_html(tmp_path, album, [track]).read_text(encoding="utf-8")
-    assert "osc1.start(startAt)" in player
-    assert "function scheduleHumNode" in player
+    assert "SL.formant.scheduleNote" in player
+    assert "SL?.formant?.cancelSchedule" in player
+    assert "timestamped formant scheduling API missing" in player
+    assert "createOscillator" not in player
+    assert "function scheduleHumNode" not in player
+    assert "render();scheduleGuide();if(!audio.paused" not in player
     assert "guideTimers" not in player
     assert "setTimeout(()=>" not in player

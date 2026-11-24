@@ -96,7 +96,10 @@ karaokeizer-audit-transcripts C:\path\to\work\transcripts\candidate-001 `
 
 First create the safety allowlist for the reviewed SSLI browser distribution.
 The command rejects symlinks/junctions, hidden files, unexpected types, and
-oversized trees; rerun it whenever the distribution intentionally changes.
+oversized trees; rerun it whenever the distribution intentionally changes. The
+distribution must implement Karaokeizer's timestamped formant scheduling
+contract; immediate `noteOn`/timer-based releases are deliberately rejected.
+See [the SSLI integration contract](docs/ssli-integration.md).
 
 ```powershell
 karaokeizer-manifest-ssli C:\path\to\ssli-distribution
@@ -154,6 +157,12 @@ Tests use synthetic fixtures and never require the private album used during ini
 ## Security and privacy
 
 Read [SECURITY.md](SECURITY.md). Keep purchased media, generated stems, transcripts, and lyric references out of commits unless you have the rights to redistribute them.
+
+## License
+
+Karaokeizer is licensed under the [Apache License 2.0](LICENSE). SSLI, media,
+models, and other third-party inputs are not bundled; their own licenses and
+redistribution terms continue to apply.
 
 ## Contributing
 

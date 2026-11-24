@@ -18,6 +18,19 @@ ALLOWED_SUFFIXES = {
 MAX_FILES = 10_000
 MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_TOTAL_BYTES = 500 * 1024 * 1024
+REQUIRED_FORMANT_API = ("scheduleNote", "cancelSchedule")
+
+UNSAFE_WINDOWS_ATTRIBUTES = sum(
+    getattr(stat, name, 0)
+    for name in (
+        "FILE_ATTRIBUTE_HIDDEN",
+        "FILE_ATTRIBUTE_SYSTEM",
+        "FILE_ATTRIBUTE_DEVICE",
+        "FILE_ATTRIBUTE_OFFLINE",
+        "FILE_ATTRIBUTE_ENCRYPTED",
+        "FILE_ATTRIBUTE_REPARSE_POINT",
+    )
+)
 
 
 def sha256(path: Path) -> str:
@@ -30,32 +43,39 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def is_link_or_reparse(path: Path) -> bool:
-    """Detect POSIX links and Windows junction/reparse entries."""
+def has_unsafe_metadata(path: Path) -> bool:
+    """Detect links and Windows attributes unsuitable for a public bundle.
+
+    Name-based dot-file checks are insufficient on Windows: an ordinary-looking
+    file may be marked Hidden or System.  Treat all such metadata as a review
+    failure instead of silently copying a potentially private file.
+    """
 
     metadata = path.lstat()
     attributes = getattr(metadata, "st_file_attributes", 0)
-    return path.is_symlink() or bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    return path.is_symlink() or bool(attributes & UNSAFE_WINDOWS_ATTRIBUTES)
 
 
 def distribution_files(root: Path) -> list[Path]:
     """Return allowed regular files, rejecting hidden, linked, or oversized input."""
 
     root = root.resolve(strict=True)
+    if has_unsafe_metadata(root):
+        raise ValueError("SSLI distribution root has linked or unsafe Windows metadata")
     files: list[Path] = []
     total = 0
     for current, directories, names in os.walk(root, followlinks=False):
         current_path = Path(current)
         for name in list(directories):
             path = current_path / name
-            if name.startswith(".") or is_link_or_reparse(path):
+            if name.startswith(".") or has_unsafe_metadata(path):
                 raise ValueError(f"SSLI distribution contains hidden or linked directory: {path.relative_to(root)}")
         for name in names:
             path = current_path / name
             relative = path.relative_to(root)
             if name == MANIFEST_NAME:
                 continue
-            if name.startswith(".") or is_link_or_reparse(path) or not path.is_file():
+            if name.startswith(".") or has_unsafe_metadata(path) or not path.is_file():
                 raise ValueError(f"SSLI distribution contains hidden, linked, or special file: {relative}")
             if path.suffix.lower() not in ALLOWED_SUFFIXES:
                 raise ValueError(f"SSLI distribution contains unexpected file type: {relative}")
@@ -68,6 +88,12 @@ def distribution_files(root: Path) -> list[Path]:
                 raise ValueError("SSLI distribution exceeds file-count or total-size limit")
     if not (root / "index.html").is_file() or (root / "index.html") not in files:
         raise ValueError("SSLI distribution must contain a regular index.html")
+    index_source = (root / "index.html").read_text(encoding="utf-8", errors="replace")
+    missing_api = [name for name in REQUIRED_FORMANT_API if name not in index_source]
+    if missing_api:
+        raise ValueError(
+            "SSLI distribution lacks the timestamped formant scheduling API: " + ", ".join(missing_api)
+        )
     return sorted(files, key=lambda path: path.relative_to(root).as_posix())
 
 

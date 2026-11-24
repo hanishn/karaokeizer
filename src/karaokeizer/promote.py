@@ -90,13 +90,14 @@ def promote_tree(canonical: Path, artifacts: list[tuple[Path, str]]) -> tuple[li
 def write_receipt_or_rollback(path: Path, receipt: dict, canonical: Path, backup: Path | None) -> None:
     """Publish the receipt atomically, restoring canonical if publication fails."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    temporary: Path | None = None
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
         temporary.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
         os.replace(temporary, path)
     except Exception:
-        if temporary.exists():
+        if temporary is not None and temporary.exists():
             temporary.unlink()
         failed = canonical.parent / f".{canonical.name}.failed-{uuid.uuid4().hex}"
         if canonical.exists():

@@ -85,7 +85,22 @@ def main() -> int:
         csp = navigation.headers.get("content-security-policy", "")
         if "frame-ancestors 'none'" not in csp or "connect-src 'none'" not in csp:
             raise ValueError("player response lacks the required restrictive Content-Security-Policy")
-        inventory = page.evaluate("tracks.map((t,index)=>({index,title:t.title,segments:t.segments.map(s=>({start:s.start,end:s.end}))}))")
+        for _ in range(100):
+            if page.locator("#ssli-engine").evaluate("frame => Boolean(frame.contentWindow?.SynthLab)"):
+                break
+            page.wait_for_timeout(100)
+        else:
+            raise ValueError("SSLI iframe did not expose SynthLab within 10 seconds")
+        guide_state = page.evaluate(
+            """async () => {
+                const button=document.querySelector('#guide-toggle');
+                if(!button)return {present:false,enabled:false,status:'missing guide control'};
+                button.click();
+                await new Promise(resolve=>setTimeout(resolve,100));
+                return {present:true,enabled:button.getAttribute('aria-pressed')==='true',status:document.querySelector('#guide-status')?.textContent||''};
+            }"""
+        )
+        inventory = page.evaluate("tracks.map((t,index)=>({index,title:t.title,noteCount:t.note_events.length,segments:t.segments.map(s=>({start:s.start,end:s.end}))}))")
         for track in inventory:
             segments = track["segments"]
             if not segments:
@@ -96,12 +111,20 @@ def main() -> int:
             sample_times = sorted(set(sample_times + extra_samples.get(track["index"] + 1, [])))
             samples = []
             for sample_index, time in enumerate(sample_times, 1):
-                page.locator("#list button").nth(track["index"]).evaluate("button=>button.click()")
+                page.evaluate("index => { load(index, false); audio.load(); }", track["index"])
                 try:
-                    page.wait_for_function("audio.readyState >= 1", timeout=10_000)
-                    media_ready = True
-                except Exception:
+                    for _ in range(100):
+                        if page.locator("#audio").evaluate("node => node.readyState >= 1"):
+                            media_ready = True
+                            media_error = None
+                            break
+                        page.wait_for_timeout(100)
+                    else:
+                        media_ready = False
+                        media_error = "audio metadata did not become ready within 10 seconds"
+                except Exception as error:
                     media_ready = False
+                    media_error = str(error)
                 result = page.evaluate(
                     """time => {
                         audio.currentTime=time; render();
@@ -124,6 +147,7 @@ def main() -> int:
                     time,
                 )
                 result["mediaReady"] = media_ready
+                result["mediaError"] = media_error
                 if sample_index == 1 and media_ready:
                     result["playbackAdvanced"] = page.evaluate(
                         """async () => {
@@ -155,6 +179,15 @@ def main() -> int:
             if any(not sample["playbackAdvanced"] for sample in samples):
                 failures.append("audio_playback_clock_did_not_advance")
             rows.append({"track": track["index"] + 1, "title": track["title"], "samples": samples, "failures": failures, "pass": not failures})
+        guide_telemetry = page.evaluate("window.karaokeGuideTelemetry")
+        expected_guide_notes = sum(track["noteCount"] for track in inventory)
+        guide_state["telemetry"] = guide_telemetry
+        guide_state["pass"] = (
+            guide_state["present"]
+            and guide_state["enabled"]
+            and (expected_guide_notes == 0 or guide_telemetry.get("scheduled", 0) > 0)
+            and (expected_guide_notes == 0 or guide_telemetry.get("cancelled", 0) > 0)
+        )
         browser.close()
     report = {
         "schema": "karaoke-player-visual-audit/v1",
@@ -167,9 +200,16 @@ def main() -> int:
         "page_errors": page_errors,
         "request_failures": request_failures,
         "external_requests": external_requests,
+        "guide_voice": guide_state,
         "passing_tracks": sum(row["pass"] for row in rows),
         "track_count": len(rows),
-        "pass": not page_errors and not request_failures and not external_requests and all(row["pass"] for row in rows),
+        "pass": (
+            not page_errors
+            and not request_failures
+            and not external_requests
+            and guide_state["pass"]
+            and all(row["pass"] for row in rows)
+        ),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
