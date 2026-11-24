@@ -33,7 +33,7 @@ separation = ["demucs>=4.0,<5"]
 transcription = ["openai-whisper>=20240930,<20270000"]
 fast-transcription = ["faster-whisper>=1.1,<2"]
 visual-qa = ["playwright>=1.49,<2"]
-dev = ["hatchling>=1.27,<2", "pytest>=8.3,<9", "ruff>=0.8,<1", "playwright>=1.49,<2", "numpy<2.5"]
+dev = ["hatchling>=1.27,<2", "pytest>=8.3,<9", "ruff>=0.8,<1", "playwright>=1.49,<2", "numpy<2.5", "scipy<1.18"]
 all = [
   "demucs>=4.0,<5",
   "openai-whisper>=20240930,<20270000",
