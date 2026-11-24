@@ -79,9 +79,50 @@ def validate_replacement(segments: list[dict], region_start: float, region_end: 
     return failures
 
 
+def retained_segments_outside_region(segments: list[dict], start: float, end: float) -> list[dict]:
+    """Preserve words outside a padded repair interval, even in intersecting segments."""
+
+    retained: list[dict] = []
+    for segment in segments:
+        if float(segment["end"]) <= start or float(segment["start"]) >= end:
+            retained.append(segment)
+            continue
+        words = [
+            dict(word) for word in segment.get("words", [])
+            if float(word["end"]) <= start or float(word["start"]) >= end
+        ]
+        if words:
+            retained.append({
+                **segment,
+                "start": min(float(word["start"]) for word in words),
+                "end": max(float(word["end"]) for word in words),
+                "text": " ".join(str(word.get("text", "")) for word in words).strip(),
+                "words": words,
+            })
+    return retained
+
+
+def validate_merged_timeline(segments: list[dict]) -> list[str]:
+    """Validate chronological word timing across replacement boundaries."""
+
+    failures: list[str] = []
+    previous_start = -1.0
+    previous_end = -1.0
+    for segment in sorted(segments, key=lambda item: float(item["start"])):
+        for word in segment.get("words", []):
+            start, end = float(word["start"]), float(word["end"])
+            if start <= previous_start:
+                failures.append("non_monotonic_or_duplicate_word_start")
+            if previous_end - start > 0.12:
+                failures.append("cross_boundary_word_overlap")
+            previous_start, previous_end = start, end
+    return sorted(set(failures))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--album-manifest", required=True, type=Path)
+    parser.add_argument("--stem-root", required=True, type=Path)
     parser.add_argument("--transcripts", required=True, type=Path)
     parser.add_argument("--qa-ledger", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
@@ -94,6 +135,7 @@ def main() -> int:
     album = json.loads(args.album_manifest.read_text(encoding="utf-8"))
     ledger = json.loads(args.qa_ledger.read_text(encoding="utf-8"))
     tracks = {int(track["number"]): track for track in album["tracks"]}
+    stem_root = args.stem_root.resolve(strict=True)
     skip = {int(value) for value in args.skip_tracks.split(",") if value.strip()}
     existing = list(args.output_dir.glob("*.whisper.json")) if args.output_dir.exists() else []
     if existing and not args.resume:
@@ -116,13 +158,16 @@ def main() -> int:
         track = tracks[track_number]
         destination = args.output_dir / f"{track_number:02d} - {track['title']}.whisper.json"
         transcript = json.loads(destination.read_text(encoding="utf-8"))
-        audio = whisper.load_audio(str(track["vocal_stem"]))
+        vocal_path = (stem_root / track["vocal_stem"]).resolve(strict=True)
+        if not vocal_path.is_relative_to(stem_root):
+            raise ValueError(f"vocal stem escapes --stem-root: {track['vocal_stem']}")
+        audio = whisper.load_audio(str(vocal_path))
         sample_rate = whisper.audio.SAMPLE_RATE
         region_records = []
         for region_index, region in enumerate(regions, 1):
             start, end = float(region["start"]), float(region["end"])
             if region.get("action") == "drop_hallucination":
-                transcript["segments"] = [segment for segment in transcript["segments"] if float(segment["end"]) <= start or float(segment["start"]) >= end]
+                transcript["segments"] = retained_segments_outside_region(transcript["segments"], start, end)
                 region_records.append({"start": start, "end": end, "action": "drop_hallucination", "replacement_segments": 0})
                 print(f"track {track_number:02d} region {region_index}/{len(regions)}: drop low-energy hallucination {start:.3f}-{end:.3f}", flush=True)
                 continue
@@ -146,8 +191,16 @@ def main() -> int:
                     f"REJECTED ({len(validation_failures)} structural failures)", flush=True,
                 )
                 continue
-            retained = [segment for segment in transcript["segments"] if float(segment["end"]) <= start or float(segment["start"]) >= end]
-            transcript["segments"] = sorted(retained + replacement, key=lambda segment: float(segment["start"]))
+            retained = retained_segments_outside_region(transcript["segments"], start, end)
+            merged = sorted(retained + replacement, key=lambda segment: float(segment["start"]))
+            merge_failures = validate_merged_timeline(merged)
+            if merge_failures:
+                region_records.append({
+                    "start": start, "end": end, "action": "retranscribe", "status": "rejected",
+                    "replacement_segments": len(replacement), "validation_failures": merge_failures,
+                })
+                continue
+            transcript["segments"] = merged
             region_records.append({"start": start, "end": end, "action": "retranscribe", "status": "accepted", "replacement_segments": len(replacement)})
         normalize_stats(transcript)
         transcript["whisper"] = {

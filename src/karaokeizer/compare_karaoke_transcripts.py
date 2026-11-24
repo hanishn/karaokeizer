@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 from pathlib import Path
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def normalized_words(data: dict, start: float | None = None, end: float | None = None) -> list[str]:
@@ -44,6 +51,8 @@ def main() -> int:
         primary_data = json.loads(primary_path.read_text(encoding="utf-8"))
         candidate_data = json.loads(candidate_path.read_text(encoding="utf-8"))
         primary_words, candidate_words = normalized_words(primary_data), normalized_words(candidate_data)
+        primary_instrumental = (primary_data.get("lyric_classification") or {}).get("status") == "instrumental_or_no_reliable_vocal"
+        candidate_instrumental = (candidate_data.get("lyric_classification") or {}).get("status") == "instrumental_or_no_reliable_vocal"
         distance = edit_distance(primary_words, candidate_words)
         disagreement = distance / max(1, max(len(primary_words), len(candidate_words)))
         remediations = candidate_data.get("qa_remediation", [])
@@ -62,15 +71,19 @@ def main() -> int:
                 "edit_distance": region_distance, "disagreement_ratio": round(region_disagreement, 5),
                 "pass": region_disagreement <= args.max_disagreement,
             })
-        regional_pass = all(region["pass"] for region in region_rows) if region_rows else disagreement <= args.max_disagreement
+        content_valid = bool(primary_words and candidate_words) or (primary_instrumental and candidate_instrumental)
+        regional_pass = (all(region["pass"] for region in region_rows) if region_rows else disagreement <= args.max_disagreement) and content_valid
         rows.append({
             "file": primary_path.name,
+            "primary_sha256": sha256(primary_path),
+            "candidate_sha256": sha256(candidate_path),
             "primary_words": len(primary_words),
             "candidate_words": len(candidate_words),
             "edit_distance": distance,
             "disagreement_ratio": round(disagreement, 5),
             "regions": region_rows,
-            "requires_lyric_review": not regional_pass,
+            "requires_lyric_review": not (primary_instrumental and candidate_instrumental),
+            "failure": None if content_valid else "empty_transcripts_without_instrumental_classification",
             "pass": regional_pass,
         })
     report = {

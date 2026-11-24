@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 from datetime import UTC, datetime
@@ -12,12 +13,22 @@ from playwright.sync_api import sync_playwright
 
 
 def safe_name(value: str) -> str:
+    """Convert a label into a stable screenshot filename component."""
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
 
 
+def sha256(path: Path) -> str:
+    """Hash the exact player document exercised by the browser audit."""
+    digest = hashlib.sha256()
+    digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 def main() -> int:
+    """Exercise representative player times in Chromium and retain evidence."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True)
+    parser.add_argument("--player", required=True, type=Path, help="Local player file bound into the audit evidence")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--evidence-dir", required=True, type=Path)
     parser.add_argument("--samples-per-track", type=int, default=3)
@@ -55,18 +66,19 @@ def main() -> int:
                         audio.currentTime=time; render();
                         const t=tracks[current],v=notationWindow(t,time),lanes=stableWordLaneMap(t),events=visualNoteEvents(t);
                         sctx.save();sctx.font='800 19px system-ui';
+                        const unboundWords=[],clippedWords=[];
                         const visible=t.words.map(w=>{
                             const notes=events.filter(n=>n.word_index===w.word_index);
-                            if(!notes.length)return null;
-                            const start=notes[0].start+lyricBias,end=Math.max(effectiveEnd(w),...notes.map(n=>n.end))+lyricBias;
+                            const start=(notes[0]?.start??w.start)+lyricBias,end=Math.max(effectiveEnd(w),...notes.map(n=>n.end))+lyricBias;
                             if(end<v.start||start>v.end)return null;
+                            if(!notes.length)unboundWords.push(w.text);
                             const plotStart=drawTimeSignature(t,drawKeySignature(t)+10),x=plotStart+(start-v.start)/(v.end-v.start)*(staff.width-plotStart),width=sctx.measureText(String(w.text||'').trim()).width;
-                            if(x<plotStart+8||x+width>staff.width-8)return null;
+                            if(x<plotStart+8||x+width>staff.width-8){clippedWords.push(w.text);return null}
                             return {text:w.text,x,width,lane:lanes.get(w),start,end};
                         }).filter(Boolean);sctx.restore();
                         const collisions=[];
                         for(let i=0;i<visible.length;i++)for(let j=i+1;j<visible.length;j++)if(visible[i].lane===visible[j].lane&&visible[i].x<visible[j].x+visible[j].width&&visible[j].x<visible[i].x+visible[i].width)collisions.push([visible[i].text,visible[j].text]);
-                        return {time,state:analysisState.textContent,kind:analysisState.className,visible,collisions,horizontalOverflow:document.documentElement.scrollWidth>document.documentElement.clientWidth};
+                        return {time,state:analysisState.textContent,kind:analysisState.className,visible,collisions,unboundWords,clippedWords,horizontalOverflow:document.documentElement.scrollWidth>document.documentElement.clientWidth};
                     }""",
                     time,
                 )
@@ -79,12 +91,18 @@ def main() -> int:
                 failures.append("word_collision")
             if any(sample["horizontalOverflow"] for sample in samples):
                 failures.append("horizontal_page_overflow")
+            if any(sample["unboundWords"] for sample in samples):
+                failures.append("visible_lyric_without_note_binding")
+            if any(sample["clippedWords"] for sample in samples):
+                failures.append("lyric_clipped_at_notation_edge")
             rows.append({"track": track["index"] + 1, "title": track["title"], "samples": samples, "failures": failures, "pass": not failures})
         browser.close()
     report = {
         "schema": "karaoke-player-visual-audit/v1",
         "created_utc": datetime.now(UTC).isoformat(),
         "url": args.url,
+        "player": str(args.player),
+        "player_sha256": sha256(args.player),
         "tracks": rows,
         "page_errors": page_errors,
         "passing_tracks": sum(row["pass"] for row in rows),

@@ -1,0 +1,20 @@
+{
+  "schema": "karaokeizer-analysis-overrides/v1",
+  "reviewer": "replace-with-reviewer-name",
+  "reviewed_utc": "2026-01-01T00:00:00Z",
+  "tracks": {
+    "1": {
+      "key": {
+        "tonic": "C",
+        "mode": "major",
+        "evidence": "Reviewed against the recording and score or trusted metadata."
+      },
+      "meter": {
+        "numerator": 4,
+        "denominator": 4,
+        "downbeat_phase": 0,
+        "evidence": "Downbeat phase checked through multiple measures."
+      }
+    }
+  }
+}

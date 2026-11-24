@@ -51,6 +51,11 @@ python -m pip install -e ".[all,dev]"
 playwright install chromium
 ```
 
+On macOS or Linux, replace the activation command with
+`source .venv/bin/activate`. Install FFmpeg with your platform package manager
+(for example, `brew install ffmpeg` or `sudo apt install ffmpeg`). The remaining
+commands and manifest formats are platform-independent.
+
 For a smaller installation, select only the stages you need, such as `.[separation]`, `.[transcription]`, or `.[visual-qa]`.
 
 ## First album
@@ -67,6 +72,7 @@ karaokeizer-album all --config C:\path\to\album-config.json
 ```powershell
 karaokeizer-transcribe `
   --album-manifest C:\path\to\output\pipeline-manifest.json `
+  --stem-root C:\path\to\work `
   --output-dir C:\path\to\work\transcripts\candidate-001 `
   --model large-v3
 ```
@@ -84,10 +90,21 @@ karaokeizer-audit-transcripts C:\path\to\work\transcripts\candidate-001 `
 ```powershell
 karaokeizer-build-player `
   --album-manifest C:\path\to\output\pipeline-manifest.json `
-  --transcripts C:\path\to\work\transcripts\promoted
+  --transcripts C:\path\to\work\transcripts\promoted `
+  --stem-root C:\path\to\work `
+  --media-root C:\path\to\output `
+  --canonical-dir C:\path\to\published `
+  --analysis-overrides C:\path\to\analysis-overrides.json `
+  --output-dir C:\path\to\work\rendered-candidate-001
 
-karaokeizer-serve --root C:\path\to\output --port 8003
+karaokeizer-serve --root C:\path\to\work\rendered-candidate-001 --port 8003
 ```
+
+`--output-dir` must be a new or empty candidate directory. The builder never
+silently replaces the canonical player. After the album, transcript-consensus,
+lyric-review, and rendered-browser ledgers pass, use `karaokeizer-promote` to
+copy the exact hash-bound candidate into the canonical directory. See the
+complete command sequence in [the QA guide](docs/qa-pipeline.md).
 
 The server prints the local URL. File URLs are intentionally avoided because browsers impose inconsistent media and iframe restrictions on `file://` pages.
 
@@ -102,6 +119,8 @@ The server prints the local URL. File URLs are intentionally avoided because bro
 | Rendered player | Browser exceptions, word collisions, overflow, high-risk timestamp regressions |
 
 Passing structural timing does **not** mean that generated words are lyrically correct. Supply an authorized lyric reference or perform a listening review before marking lyrics verified.
+
+Likewise, stem reconstruction alone cannot prove that the accompaniment is vocal-free. The album audit requires an independent per-track separation review using the format in [`examples/separation-review.json`](examples/separation-review.json); pass it with `--separation-review`.
 
 ## Repository hygiene
 

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import math
+import os
 import re
 import unicodedata
 from datetime import UTC, datetime
@@ -14,6 +16,9 @@ from pathlib import Path
 import librosa
 import numpy as np
 import pyphen
+
+from .html_safety import json_for_script
+from .paths import safe_component
 
 SCHEMA = "karaoke-overlay/v1"
 KEY_METHOD = "cqt_chroma_ks-v1"
@@ -39,11 +44,13 @@ def lyric_syllables(text: str) -> list[str]:
 
 
 def has_unexpected_script(text: str) -> bool:
+    """Flag scripts outside the configured lyric alphabet for human review."""
     blocked = ("CYRILLIC", "HANGUL", "CJK", "HIRAGANA", "KATAKANA", "ARABIC", "HEBREW", "DEVANAGARI")
     return any(any(script in unicodedata.name(char, "") for script in blocked) for char in text)
 
 
 def sha256(path: Path) -> str:
+    """Hash one input or rendered artifact for downstream evidence binding."""
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -52,10 +59,12 @@ def sha256(path: Path) -> str:
 
 
 def note_for_midi(midi: float | None) -> str | None:
+    """Format a MIDI pitch as a note name with octave, or return ``None``."""
     return librosa.midi_to_note(midi, octave=True, cents=False) if midi is not None else None
 
 
 def classify_chroma(chroma: np.ndarray) -> list[dict]:
+    """Rank all major and minor keys against an averaged chroma vector."""
     vector = np.mean(chroma, axis=1)
     scores = []
     for tonic in range(12):
@@ -66,6 +75,7 @@ def classify_chroma(chroma: np.ndarray) -> list[dict]:
 
 
 def detect_key(audio: Path) -> dict:
+    """Estimate key from audio and expose confidence and runner-up data."""
     y, sr = librosa.load(audio, sr=22050, mono=True)
     harmonic = librosa.effects.harmonic(y)
     ranked = classify_chroma(librosa.feature.chroma_cqt(y=harmonic, sr=sr))
@@ -89,12 +99,17 @@ def detect_key(audio: Path) -> dict:
         "score": round(best["score"], 6),
         "runner_up": {"label": second["label"], "score": round(second["score"], 6)},
         "section_checks": sections, "section_agreement": agreement,
-        "method": KEY_METHOD, "analysis_audio": str(audio),
+        "method": KEY_METHOD,
     }
 
 
-def analyze_rhythm(audio: Path) -> dict:
-    """Estimate a stable beat grid and 4/4 measure phase from the accompaniment."""
+def analyze_rhythm(audio: Path, meter_override: dict | None = None) -> dict:
+    """Estimate beats and apply an explicit, reviewed meter/downbeat override."""
+    meter_override = meter_override or {}
+    numerator = int(meter_override.get("numerator", 4))
+    denominator = int(meter_override.get("denominator", 4))
+    if numerator < 2 or numerator > 12 or denominator not in {2, 4, 8, 16}:
+        raise ValueError("meter override must use numerator 2..12 and denominator 2, 4, 8, or 16")
     y, sr = librosa.load(audio, sr=22050, mono=True)
     onset = librosa.onset.onset_strength(y=y, sr=sr)
     tempo, beat_frames = librosa.beat.beat_track(onset_envelope=onset, sr=sr, units="frames")
@@ -102,28 +117,34 @@ def analyze_rhythm(audio: Path) -> dict:
     beat_times = librosa.frames_to_time(beat_frames, sr=sr)
     bpm = float(np.asarray(tempo).reshape(-1)[0]) if np.asarray(tempo).size else 0.0
     if not len(beat_times):
-        return {"tempo_bpm": 0.0, "meter": {"numerator": 4, "denominator": 4, "status": "estimated"},
+        return {"tempo_bpm": 0.0, "meter": {"numerator": numerator, "denominator": denominator, "status": "no_beat_grid"},
                 "beats": [], "measures": [], "method": RHYTHM_METHOD}
     strengths = onset[np.clip(beat_frames, 0, len(onset) - 1)]
-    phase_scores = [float(np.sum(strengths[p::4])) for p in range(4)]
-    downbeat_phase = int(np.argmax(phase_scores))
-    beats = [{"time": round(float(t), 3), "beat": ((i - downbeat_phase) % 4) + 1}
+    phase_scores = [float(np.sum(strengths[p::numerator])) for p in range(numerator)]
+    downbeat_phase = int(meter_override.get("downbeat_phase", np.argmax(phase_scores)))
+    if not 0 <= downbeat_phase < numerator:
+        raise ValueError("downbeat_phase must be within the selected meter")
+    beats = [{"time": round(float(t), 3), "beat": ((i - downbeat_phase) % numerator) + 1}
              for i, t in enumerate(beat_times)]
     measures = []
     number = 1
-    downbeat_indices = [i for i in range(downbeat_phase, len(beats), 4)]
+    downbeat_indices = [i for i in range(downbeat_phase, len(beats), numerator)]
     for pos, index in enumerate(downbeat_indices):
-        end_index = downbeat_indices[pos + 1] if pos + 1 < len(downbeat_indices) else min(index + 4, len(beats))
+        end_index = downbeat_indices[pos + 1] if pos + 1 < len(downbeat_indices) else min(index + numerator, len(beats))
         end_time = beats[end_index]["time"] if end_index < len(beats) else round(float(librosa.get_duration(y=y, sr=sr)), 3)
         measures.append({"number": number, "start": beats[index]["time"], "end": end_time})
         number += 1
     return {"tempo_bpm": round(bpm, 2),
-            "meter": {"numerator": 4, "denominator": 4, "status": "estimated"},
+            "meter": {
+                "numerator": numerator, "denominator": denominator,
+                "status": "verified_override" if meter_override else "estimated_unverified",
+            },
             "beats": beats, "measures": measures, "downbeat_phase": downbeat_phase,
             "method": RHYTHM_METHOD}
 
 
 def analyze_pitch(vocal: Path, words: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Extract a vocal pitch contour and bind note events to timed words."""
     y, sr = librosa.load(vocal, sr=22050, mono=True)
     hop = 512
     f0, voiced, probability = librosa.pyin(
@@ -191,81 +212,74 @@ def annotate_words_from_contour(contour: list[dict], words: list[dict]) -> list[
 
 
 def contour_to_note_events(contour: list[dict], words: list[dict]) -> list[dict]:
-    """Turn frame-level f0 into sung note events, independent of Whisper word boundaries."""
+    """Turn frame-level f0 into note events split at every lyric-word boundary."""
     if not contour:
         return []
-    lyric_ranges = sorted((float(w["start"]) - 0.06, float(w["end"]) + 0.10) for w in words)
-    contour = [p for p in contour if any(start <= float(p["time"]) <= end for start, end in lyric_ranges)]
     events: list[dict] = []
-    current: list[dict] = []
+    for lyric_word in words:
+        word_start, word_end = float(lyric_word["start"]), float(lyric_word["end"])
+        points = [point for point in contour if word_start - 0.04 <= float(point["time"]) <= word_end + 0.06]
+        current: list[dict] = []
 
-    def flush() -> None:
-        nonlocal current
-        if not current:
-            return
-        start = float(current[0]["time"])
-        step = float(np.median(np.diff([p["time"] for p in current]))) if len(current) > 1 else 0.093
-        end = float(current[-1]["time"]) + max(0.06, step)
-        if end - start >= 0.11:
-            midi = int(round(float(np.median([p["midi"] for p in current]))))
-            overlaps = [(max(0.0, min(end, float(w["end"])) - max(start, float(w["start"]))), w) for w in words]
-            overlap, lyric_word = max(overlaps, key=lambda pair: pair[0], default=(0.0, {}))
-            lyric = lyric_word.get("text", "") if overlap > 0 else ""
-            events.append({"start": round(start, 3), "end": round(end, 3), "midi": midi,
-                           "note": note_for_midi(midi), "pitch_confidence": round(float(np.mean([p["probability"] for p in current])), 4),
-                           "lyric": lyric, "word_index": lyric_word.get("word_index") if overlap > 0 else None})
-        current = []
+        def flush_word_event(
+            word_start: float = word_start,
+            word_end: float = word_end,
+            lyric_word: dict = lyric_word,
+        ) -> None:
+            nonlocal current
+            if not current:
+                return
+            start = max(word_start, float(current[0]["time"]))
+            step = float(np.median(np.diff([p["time"] for p in current]))) if len(current) > 1 else 0.093
+            end = min(word_end, float(current[-1]["time"]) + max(0.06, step))
+            if end - start >= 0.06:
+                midi = int(round(float(np.median([p["midi"] for p in current]))))
+                events.append({
+                    "start": round(start, 3), "end": round(end, 3), "midi": midi,
+                    "note": note_for_midi(midi),
+                    "pitch_confidence": round(float(np.mean([p["probability"] for p in current])), 4),
+                    "lyric": lyric_word.get("text", ""), "word_index": lyric_word.get("word_index"),
+                })
+            current = []
 
-    for point in contour:
-        rounded = int(round(point["midi"]))
-        if not current:
-            current = [point]
-            continue
-        previous_time = float(current[-1]["time"])
-        center = int(round(float(np.median([p["midi"] for p in current[-5:]]))))
-        if float(point["time"]) - previous_time > 0.18 or abs(rounded - center) >= 1:
-            flush()
-        current.append(point)
-    flush()
-    merged: list[dict] = []
-    for event in events:
-        if merged and event["midi"] == merged[-1]["midi"] and event.get("word_index") == merged[-1].get("word_index") and event["start"] - merged[-1]["end"] <= 0.12:
-            merged[-1]["end"] = event["end"]
-            if not merged[-1]["lyric"]:
-                merged[-1]["lyric"] = event["lyric"]
-        else:
-            merged.append(event)
-    return merged
+        for point in points:
+            rounded = int(round(point["midi"]))
+            if current:
+                previous_time = float(current[-1]["time"])
+                center = int(round(float(np.median([p["midi"] for p in current[-5:]]))))
+                if float(point["time"]) - previous_time > 0.18 or abs(rounded - center) >= 1:
+                    flush_word_event()
+            current.append(point)
+        flush_word_event()
+    return events
 
 
-def repair_zero_duration_repeated_segments(segments: list[dict]) -> list[dict]:
-    """Repair collapsed Whisper word timestamps from an earlier valid repeat of the phrase."""
-    templates: dict[str, dict] = {}
-    repaired: list[dict] = []
-    for source in segments:
-        segment = dict(source)
-        segment["words"] = [dict(word) for word in source.get("words", [])]
-        normalized = re.sub(r"[^a-z0-9' ]+", "", str(segment.get("text", "")).lower()).strip()
-        words = segment["words"]
-        collapsed = any(float(word["end"]) - float(word["start"]) <= 0.001 for word in words)
-        template = templates.get(normalized)
-        if collapsed and template and len(template["words"]) == len(words):
-            template_words = template["words"]
-            template_start = float(template_words[0]["start"])
-            template_end = float(template_words[-1]["end"])
-            target_start = float(segment["start"])
-            target_end = float(segment["end"])
-            if template_end > template_start and target_end > target_start:
-                for word, template_word in zip(words, template_words, strict=True):
-                    relative_start = (float(template_word["start"]) - template_start) / (template_end - template_start)
-                    relative_end = (float(template_word["end"]) - template_start) / (template_end - template_start)
-                    word["start"] = round(target_start + relative_start * (target_end - target_start), 3)
-                    word["end"] = round(target_start + relative_end * (target_end - target_start), 3)
-                segment["timing_repair"] = "scaled_from_prior_identical_phrase"
-        if words and all(float(word["end"]) - float(word["start"]) > 0.001 for word in words):
-            templates[normalized] = segment
-        repaired.append(segment)
-    return repaired
+def analysis_cache_key(track: dict, transcript_hash: str) -> dict:
+    """Describe every input and algorithm version that can affect analysis."""
+
+    return {
+        "vocal_sha256": track["vocal_sha256"],
+        "accompaniment_sha256": track["accompaniment_sha256"],
+        "transcript_sha256": transcript_hash,
+        "pitch_method": PITCH_METHOD,
+        "key_method": KEY_METHOD,
+        "rhythm_method": RHYTHM_METHOD,
+    }
+
+
+def apply_key_override(detected: dict, override: dict | None) -> dict:
+    """Replace an estimated key only with explicit reviewed key metadata."""
+
+    if not override:
+        return detected
+    tonic, mode = str(override["tonic"]), str(override["mode"])
+    if tonic not in NOTE_NAMES or mode not in {"major", "minor"}:
+        raise ValueError("key override requires a supported tonic and major/minor mode")
+    label = f"{tonic} {mode}"
+    return {
+        **detected, "tonic": tonic, "mode": mode, "label": label, "display": label,
+        "status": "verified_override", "review": override,
+    }
 
 
 def segment_timing_errors(segment: dict) -> list[str]:
@@ -322,10 +336,12 @@ def filter_lyric_segments(segments: list[dict], transcript: dict) -> tuple[list[
 
 
 def build_html(output: Path, album: dict, tracks: list[dict]) -> Path:
-    payload = json.dumps(tracks, ensure_ascii=False, separators=(",", ":"))
-    album_name = album["config"]["album"]
-    artist = album["config"]["artist"]
-    html = f'''<!doctype html><html lang="en"><head><meta charset="utf-8">
+    """Write the generated player while keeping metadata out of HTML context."""
+    payload = json_for_script(tracks)
+    raw_album_name = safe_component(album["config"]["album"], field="album")
+    album_name = html.escape(raw_album_name)
+    artist = html.escape(str(album["config"]["artist"]))
+    html_document = f'''<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{artist} — {album_name} Karaoke</title>
 <style>:root{{color-scheme:dark;font-family:system-ui,sans-serif}}body{{margin:0;background:#070916;color:#f5f2ff}}
 main{{width:min(1100px,94vw);margin:1.5rem auto}}header{{display:flex;gap:1rem;align-items:center}}header img{{width:120px;border-radius:10px}}
@@ -381,38 +397,58 @@ function applyGuideVolume(){{const SL=ssliHost(),id=guideInstrument?.id??guideIn
 function applyGuideAdsr(){{const SL=ssliHost(),id=guideInstrument?.id??guideInstrument,slot=SL?.audio?.getInstruments?.()?.find(x=>x.id===id)||SL?.audio?.getInstruments?.()?.[id];if(!slot?.settings||!SL?.audio?.timeToSlider)return;slot.settings.adsr={{a:SL.audio.timeToSlider(guideAdsr.a,500,500),d:SL.audio.timeToSlider(guideAdsr.d,500,500),s:guideAdsr.s,r:SL.audio.timeToSlider(guideAdsr.r,1000,1000)}}}}
 function timingLabel(ms){{return ms===0?'on time':`${{Math.abs(ms)}} ms ${{ms<0?'early':'late'}}`}}
 async function initGuide(){{const SL=ssliHost();if(!SL){{guideStatus.textContent='SSLI engine is still loading';return false}}try{{const ctx=SL.audio.getCtx?.();if(ctx?.resume)await ctx.resume();SL.audio.initEffectChain?.();if(SL.formant?.init)await SL.formant.init(ctx);const inst=SL.audio.getCurrentInstrument?.()??0,alto=SL.presets.getFormantPresets?.().find(p=>p.name==='Alto Choir');if(!alto||!SL.presets.applyFormantPreset)throw new Error('Alto Choir preset missing');SL.presets.applyFormantPreset(alto,inst);SL.audio.setFormantSettings?.(inst,{{vowel:'O',vowelTarget:'U',morphX:18,breathiness:8,glottalPulseWidth:58,vowelSequenceEnabled:false}});guideInstrument=inst;const slot=SL.audio.getInstruments?.()?.find(x=>x.id===inst)||SL.audio.getInstruments?.()?.[inst];if(slot?.type!=='formant'||!slot.masterOutput)throw new Error('formant output did not initialize');applyGuideVolume();applyGuideAdsr();guideReady=true;guideStatus.textContent='SSLI warm alto hum · ready';return true}}catch(e){{guideStatus.textContent=`SSLI unavailable: ${{e.message||e}}`;return false}}}}
-function scheduleGuide(){{if(!guideEnabled||!guideReady||audio.paused)return;const SL=ssliHost(),id=guideInstrument?.id??guideInstrument;if(!SL||id===null||id===undefined)return;const now=audio.currentTime,horizon=now+.18;tracks[current].note_events.filter(w=>{{const biased=w.start+guideBias;return biased>=now-.04&&biased<=horizon}}).forEach(w=>{{const key=`${{current}}:${{w.start}}`;if(guideScheduled.has(key))return;guideScheduled.add(key);const biased=w.start+guideBias,delay=Math.max(0,(biased-now)*1000),duration=Math.max(.06,w.end-w.start);guideTimers.push(setTimeout(()=>{{if(!guideEnabled||audio.paused)return;SL.audio.playNoteOnInstrument(Math.round(w.midi),duration,id,104,{{realtimePhrase:true,releaseSeconds:guideAdsr.r/1000}})}},delay))}})}}
+function scheduleGuide(){{if(!guideEnabled||!guideReady||audio.paused)return;const SL=ssliHost(),id=guideInstrument?.id??guideInstrument;if(!SL||id===null||id===undefined)return;const now=audio.currentTime,horizon=now+1,trackAtSchedule=current,rate=Math.max(.25,audio.playbackRate||1);tracks[current].note_events.filter(w=>{{const biased=w.start+guideBias;return biased>=now-.04&&biased<=horizon}}).forEach(w=>{{const key=`${{current}}:${{w.start}}:${{w.end}}:${{w.midi}}`;if(guideScheduled.has(key))return;guideScheduled.add(key);const biased=w.start+guideBias,delay=Math.max(0,(biased-now)*1000/rate),duration=Math.max(.06,(w.end-w.start)/rate);guideTimers.push(setTimeout(()=>{{if(!guideEnabled||audio.paused||current!==trackAtSchedule)return;if(audio.currentTime>biased+.12)return;SL.audio.playNoteOnInstrument(Math.round(w.midi),duration,id,104,{{realtimePhrase:true,releaseSeconds:guideAdsr.r/1000}})}},delay))}})}}
 async function toggleGuide(){{guideEnabled=!guideEnabled;if(guideEnabled&&!guideReady)guideEnabled=await initGuide();if(!guideEnabled)resetGuide();guideToggle.classList.toggle('active',guideEnabled);guideToggle.setAttribute('aria-pressed',String(guideEnabled));guideToggle.textContent=`Humming guide: ${{guideEnabled?'on':'off'}}`}}
 function animateNotation(){{render();scheduleGuide();if(!audio.paused&&!audio.ended)animationFrame=requestAnimationFrame(animateNotation)}}
 function startNotation(){{if(animationFrame)cancelAnimationFrame(animationFrame);animationFrame=requestAnimationFrame(animateNotation)}}
 function stopNotation(){{if(animationFrame)cancelAnimationFrame(animationFrame);animationFrame=null;render()}}
 lyricBiasInput.oninput=()=>{{lyricBias=Number(lyricBiasInput.value)/1000;lyricBiasValue.textContent=timingLabel(Number(lyricBiasInput.value));render()}};
 tracks.forEach((t,i)=>{{const li=document.createElement('li'),b=document.createElement('button');b.textContent=t.title;b.onclick=()=>load(i);li.appendChild(b);list.appendChild(li)}});document.querySelectorAll('[data-view]').forEach(b=>b.onclick=()=>setView(b.dataset.view));guideToggle.onclick=toggleGuide;guideVolumeInput.oninput=()=>{{guideVolume=Number(guideVolumeInput.value)/100;guideVolumeValue.textContent=`${{guideVolumeInput.value}}%`;applyGuideVolume()}};guideBiasInput.oninput=()=>{{guideBias=Number(guideBiasInput.value)/1000;guideBiasValue.textContent=timingLabel(Number(guideBiasInput.value));resetGuide()}};[['a','ms'],['d','ms'],['s','%'],['r','ms']].forEach(([name,unit])=>{{const input=document.querySelector(`#adsr-${{name}}`),output=document.querySelector(`#adsr-${{name}}-value`);input.oninput=()=>{{guideAdsr[name]=Number(input.value);output.textContent=`${{input.value}} ${{unit}}`;applyGuideAdsr()}}}});document.querySelector('#ssli-engine').addEventListener('load',()=>{{guideStatus.textContent='SSLI warm alto hum · click to enable'}});audio.addEventListener('play',startNotation);audio.addEventListener('pause',()=>{{resetGuide();stopNotation()}});audio.addEventListener('seeking',resetGuide);audio.addEventListener('seeked',render);audio.addEventListener('ended',()=>{{resetGuide();stopNotation();if(current+1<tracks.length)load(current+1)}});document.querySelector('#track-picker').open=false;setView('staff');load(0,false);</script></main></body></html>'''
-    path = output / f"{album_name} - Karaoke.html"
-    path.write_text(html, encoding="utf-8")
+    path = output / f"{raw_album_name} - Karaoke.html"
+    path.write_text(html_document, encoding="utf-8")
     return path
 
 
 def main() -> int:
+    """Build a fresh, hash-bound HTML player candidate and data payloads."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--album-manifest", required=True, type=Path)
     parser.add_argument("--transcripts", required=True, type=Path)
+    parser.add_argument(
+        "--output-dir", required=True, type=Path,
+        help="Fresh rendered-candidate directory; never inferred from an untrusted manifest",
+    )
+    parser.add_argument("--media-root", required=True, type=Path, help="Trusted packaged-album directory containing audio")
+    parser.add_argument("--stem-root", required=True, type=Path, help="Trusted root for manifest-relative stem paths")
+    parser.add_argument("--canonical-dir", required=True, type=Path, help="Intended final player directory used for relative media URLs")
+    parser.add_argument("--analysis-cache-dir", type=Path, help="Optional read-only cache; reused only on exact cache-key match")
+    parser.add_argument("--analysis-overrides", type=Path, help="Reviewed per-track key and meter overrides")
     args = parser.parse_args()
     album = json.loads(args.album_manifest.read_text(encoding="utf-8"))
-    output = Path(album["config"]["output_dir"])
+    output = args.output_dir.resolve()
+    if output.exists() and any(output.iterdir()):
+        parser.error("rendered candidate directory must be new or empty")
+    output.mkdir(parents=True, exist_ok=True)
+    media_root = args.media_root.resolve(strict=True)
+    stem_root = args.stem_root.resolve(strict=True)
+    canonical_root = args.canonical_dir.resolve()
+    overrides = json.loads(args.analysis_overrides.read_text(encoding="utf-8")).get("tracks", {}) if args.analysis_overrides else {}
     data_dir = output / "karaoke" / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     failures = []
     player_tracks = []
     for track in album["tracks"]:
-        transcript_path = args.transcripts / f"{track['number']:02d} - {track['title']}.whisper.json"
+        safe_title = safe_component(track["title"], field=f"track {track['number']} title")
+        transcript_path = args.transcripts / f"{track['number']:02d} - {safe_title}.whisper.json"
         if not transcript_path.exists():
             failures.append(f"missing transcript: {track['title']}")
             continue
         transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
-        clean_transcript_segments = repair_zero_duration_repeated_segments([
+        # Never synthesize timing from a repeated chorus during a production
+        # build. Invalid segments are counted and routed back to remediation.
+        clean_transcript_segments = [
             segment for segment in transcript["segments"] if not has_unexpected_script(segment.get("text", ""))
-        ])
+        ]
         timing_rejected_segments = sum(bool(segment_timing_errors(segment)) for segment in clean_transcript_segments)
         words = [
             word
@@ -421,14 +457,25 @@ def main() -> int:
         ]
         data_path = data_dir / f"{track['number']:02d}.karaoke.json"
         transcript_hash = sha256(transcript_path)
-        existing = json.loads(data_path.read_text(encoding="utf-8")) if data_path.exists() else None
-        if existing and "pitch_contour" in existing:
+        vocal_path = (stem_root / track["vocal_stem"]).resolve(strict=True)
+        accompaniment_path = (stem_root / track["accompaniment_stem"]).resolve(strict=True)
+        if not vocal_path.is_relative_to(stem_root) or not accompaniment_path.is_relative_to(stem_root):
+            failures.append(f"stem path escapes --stem-root: {track['title']}")
+            continue
+        if sha256(vocal_path) != track["vocal_sha256"] or sha256(accompaniment_path) != track["accompaniment_sha256"]:
+            failures.append(f"stem hash mismatch: {track['title']}")
+            continue
+        cache_key = analysis_cache_key(track, transcript_hash)
+        cache_path = args.analysis_cache_dir / f"{track['number']:02d}.karaoke.json" if args.analysis_cache_dir else None
+        existing = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path and cache_path.exists() else None
+        cache_valid = bool(existing and existing.get("analysis_cache_key") == cache_key)
+        track_override = overrides.get(str(track["number"]), {})
+        if cache_valid and "pitch_contour" in existing:
             contour = existing["pitch_contour"]
             annotated = annotate_words_from_contour(contour, words)
-            contour = existing["pitch_contour"]
-            pitch_method = existing.get("pitch_method", "pyin-contour-93ms-v1")
+            pitch_method = PITCH_METHOD
         else:
-            annotated, contour = analyze_pitch(Path(track["vocal_stem"]), words)
+            annotated, contour = analyze_pitch(vocal_path, words)
             pitch_method = PITCH_METHOD
         for word in annotated:
             word["syllables"] = lyric_syllables(str(word.get("text", "")))
@@ -450,14 +497,19 @@ def main() -> int:
         retained_word_indices = {w["word_index"] for segment in segments for w in segment["words"]}
         retained_words = [w for w in annotated if w["word_index"] in retained_word_indices]
         pitched_midis = [w["midi"] for w in retained_words if w["midi"] is not None]
+        packaged_audio = (media_root / track["output_file"]).resolve(strict=True)
+        if not packaged_audio.is_relative_to(media_root) or sha256(packaged_audio) != track["output_sha256"]:
+            failures.append(f"packaged audio hash mismatch: {track['title']}")
+            continue
         data = {
             "schema": SCHEMA,
             "track": track["number"],
             "title": track["title"],
-            "audio": track["output_file"],
+            "audio": Path(os.path.relpath(packaged_audio, canonical_root)).as_posix(),
             "audio_sha256": track["output_sha256"],
             "vocal_sha256": track["vocal_sha256"],
             "transcript_sha256": transcript_hash,
+            "analysis_cache_key": cache_key,
             "status": lyric_status,
             "timing_rejected_segments": timing_rejected_segments,
             "segments": segments,
@@ -469,18 +521,26 @@ def main() -> int:
                 "min_midi": max(24, math.floor(float(np.percentile(pitched_midis, 5))) - 2) if pitched_midis else 36,
                 "max_midi": min(108, math.ceil(float(np.percentile(pitched_midis, 95))) + 2) if pitched_midis else 84,
             },
-            "detected_key": existing.get("detected_key") if existing and existing.get("detected_key") else detect_key(Path(track["accompaniment_stem"])),
-            "rhythm": existing.get("rhythm") if existing and existing.get("rhythm") else analyze_rhythm(Path(track["accompaniment_stem"])),
+            "detected_key": apply_key_override(
+                existing["detected_key"] if cache_valid and existing.get("detected_key") else detect_key(accompaniment_path),
+                track_override.get("key"),
+            ),
+            "rhythm": analyze_rhythm(accompaniment_path, track_override.get("meter")),
         }
         data_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         player_tracks.append(data)
     html = build_html(output, album, player_tracks) if len(player_tracks) == len(album["tracks"]) else None
+    artifact_paths = ([html] if html else []) + sorted(data_dir.glob("*.karaoke.json"))
     report = {
         "schema": SCHEMA,
         "verified_utc": datetime.now(UTC).isoformat(),
         "tracks_expected": len(album["tracks"]),
         "tracks_built": len(player_tracks),
-        "player": str(html) if html else None,
+        "player": html.name if html else None,
+        "album_manifest_sha256": sha256(args.album_manifest),
+        "artifacts": [
+            {"path": path.relative_to(output).as_posix(), "sha256": sha256(path)} for path in artifact_paths
+        ],
         "failures": failures,
         "pass": not failures and html is not None,
     }

@@ -25,7 +25,7 @@ Every stage is resumable and content-addressed. A changed source, stem, model, t
 - Vocal/accompaniment correlation is recorded as leakage evidence.
 - Instrumental tracks are detected rather than forced through lyric generation.
 
-Tool: `tools/audit_karaoke_album.py`
+Tool: `karaokeizer-audit-album`
 
 ### 2. Transcript structure gate
 
@@ -38,7 +38,7 @@ Tool: `tools/audit_karaoke_album.py`
 
 Malformed segments are never rendered. They become remediation regions.
 
-Tools: `tools/audit_karaoke_transcripts.py`, validation inside `tools/build_karaoke_overlay.py`
+Tools: `karaokeizer-audit-transcripts`, validation inside `karaokeizer-build-player`
 
 ### 3. Lyrical gate
 
@@ -50,7 +50,7 @@ Preferred order of evidence:
 
 Model agreement is not proof of correctness; it only reduces the human-review surface. Without an authorized reference, the transcript remains explicitly unverified.
 
-Tool: `tools/compare_karaoke_transcripts.py`
+Tool: `karaokeizer-compare-transcripts`
 
 ### 4. Sonic alignment and pitch gate
 
@@ -60,7 +60,7 @@ Tool: `tools/compare_karaoke_transcripts.py`
 - Estimated-pitch fraction and rejected-segment count are visible in the ledger.
 - Note onset, sustain, syllable attacks, and release share one timeline.
 
-Tools: `tools/audit_karaoke_album.py`, `tools/build_karaoke_overlay.py`
+Tools: `karaokeizer-audit-album`, `karaokeizer-build-player`
 
 ### 5. Rendered visual gate
 
@@ -71,7 +71,7 @@ Tools: `tools/audit_karaoke_album.py`, `tools/build_karaoke_overlay.py`
 - Screenshots are retained as evidence.
 - Known high-risk regions from transcript remediation receive extra samples.
 
-Tool: `tools/audit_karaoke_player_visual.py`
+Tool: `karaokeizer-audit-player`
 
 ## Automatic remediation loop
 
@@ -110,12 +110,13 @@ Album promotion requires every track to be promoted or explicitly classified as 
 ## Reusable command sequence
 
 ```powershell
-karaokeizer-transcribe --album-manifest <manifest> --output-dir <candidate-dir> --model large-v3 --backend openai --beam-size 8 --force
+karaokeizer-transcribe --album-manifest <manifest> --stem-root <work-root> --output-dir <candidate-dir> --model large-v3 --backend openai --beam-size 8 --force
 karaokeizer-audit-transcripts <candidate-dir> --output <candidate-dir>/timing-audit.json --strict
 karaokeizer-compare-transcripts --primary <canonical-dir> --candidate <candidate-dir> --output <qa-dir>/transcript-consensus.json
-karaokeizer-build-player --album-manifest <manifest> --transcripts <promoted-transcripts>
-karaokeizer-audit-album --album-manifest <manifest> --transcripts <promoted-transcripts> --karaoke-data <karaoke-data> --output <qa-dir>/album-qa-ledger.json
-karaokeizer-audit-player --url <served-player-url> --output <qa-dir>/player-visual-audit.json --evidence-dir <qa-dir>/visual-evidence
+karaokeizer-build-player --album-manifest <manifest> --transcripts <promoted-transcripts> --stem-root <work-root> --media-root <packaged-audio-root> --canonical-dir <canonical-root> --analysis-overrides <reviewed-analysis-overrides> --output-dir <fresh-rendered-candidate>
+karaokeizer-audit-album --album-manifest <manifest> --source-root <source-root> --stem-root <work-root> --transcripts <promoted-transcripts> --karaoke-data <fresh-rendered-candidate>/karaoke/data --separation-review <separation-review.json> --output <qa-dir>/album-qa-ledger.json
+karaokeizer-audit-player --url <served-player-url> --player <fresh-rendered-candidate>/<player.html> --output <qa-dir>/player-visual-audit.json --evidence-dir <qa-dir>/visual-evidence
+karaokeizer-promote --candidate-dir <fresh-rendered-candidate> --canonical-dir <canonical-root> --transcripts <promoted-transcripts> --album-ledger <qa-dir>/album-qa-ledger.json --visual-ledger <qa-dir>/player-visual-audit.json --consensus-ledger <qa-dir>/transcript-consensus.json --lyric-review <qa-dir>/lyric-review.json --receipt <qa-dir>/promotion-receipt.json
 ```
 
 The command sequence is deliberately album-agnostic; paths and manifest content define the album.

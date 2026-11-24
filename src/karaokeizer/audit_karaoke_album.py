@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -13,15 +14,28 @@ import numpy as np
 import soundfile as sf
 
 from .audit_karaoke_transcripts import audit_transcript
+from .paths import safe_component
 
 SCHEMA = "karaoke-album-qa/v1"
 
 
+def sha256(path: Path) -> str:
+    """Hash an evidence file without loading it into memory."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def db_ratio(numerator: float, denominator: float) -> float:
+    """Convert an amplitude ratio to decibels with finite silence handling."""
     return round(20 * math.log10(max(numerator, 1e-12) / max(denominator, 1e-12)), 3)
 
 
-def sonic_metrics(source: Path, vocal: Path, accompaniment: Path) -> dict:
+def sonic_metrics(source: Path, vocal: Path, accompaniment: Path, separation_review: dict | None = None) -> dict:
+    """Measure stem integrity and require independent vocal-leakage review."""
     files = [sf.SoundFile(path) for path in (source, vocal, accompaniment)]
     try:
         sample_rates = [handle.samplerate for handle in files]
@@ -55,6 +69,8 @@ def sonic_metrics(source: Path, vocal: Path, accompaniment: Path) -> dict:
             clipped += int(np.sum(np.abs(accompaniment_block) >= 0.999))
             samples += accompaniment_block.size
         source_rms = math.sqrt(sum_source / max(1, samples))
+        vocal_rms = math.sqrt(sum_vocal / max(1, samples))
+        accompaniment_rms = math.sqrt(sum_accompaniment / max(1, samples))
         optimal_gain = source_mix_dot / max(1e-12, sum_mix)
         normalized_residual_energy = max(0.0, sum_source - 2 * optimal_gain * source_mix_dot + optimal_gain * optimal_gain * sum_mix)
         residual_rms = math.sqrt(normalized_residual_energy / max(1, samples))
@@ -69,6 +85,11 @@ def sonic_metrics(source: Path, vocal: Path, accompaniment: Path) -> dict:
         reconstruction_db = db_ratio(residual_rms, source_rms)
         if reconstruction_db > -20:
             failures.append("poor_stem_reconstruction")
+        vocal_relative_db = db_ratio(vocal_rms, source_rms)
+        if vocal_relative_db < -35 and (separation_review or {}).get("track_type") != "instrumental":
+            failures.append("degenerate_or_silent_vocal_stem")
+        if not separation_review or separation_review.get("status") != "pass":
+            failures.append("vocal_leakage_not_independently_verified")
         return {
             "sample_rates": sample_rates,
             "channels": channels,
@@ -78,7 +99,10 @@ def sonic_metrics(source: Path, vocal: Path, accompaniment: Path) -> dict:
             "accompaniment_clipped_fraction": round(clipped / max(1, samples), 9),
             "stem_reconstruction_error_db": reconstruction_db,
             "stem_reconstruction_gain": round(optimal_gain, 6),
+            "vocal_rms_db_relative_source": vocal_relative_db,
+            "accompaniment_rms_db_relative_source": db_ratio(accompaniment_rms, source_rms),
             "vocal_accompaniment_correlation": round(correlation, 5),
+            "separation_review": separation_review,
             "failures": failures,
             "pass": not failures,
         }
@@ -87,7 +111,8 @@ def sonic_metrics(source: Path, vocal: Path, accompaniment: Path) -> dict:
             handle.close()
 
 
-def vocal_alignment(vocal: Path, segments: list[dict], duration: float) -> dict:
+def vocal_alignment(vocal: Path, segments: list[dict], duration: float, *, allow_empty: bool = False) -> dict:
+    """Measure lyric coverage of vocal activity without treating empty drafts as valid."""
     audio, sample_rate = sf.read(vocal, dtype="float32", always_2d=True)
     mono = np.mean(audio, axis=1)
     frame_seconds = 0.1
@@ -109,6 +134,8 @@ def vocal_alignment(vocal: Path, segments: list[dict], duration: float) -> dict:
     voiced_coverage = active_covered / max(1, active_count)
     lyric_silence = int(np.sum(covered & ~active)) / max(1, int(np.sum(covered)))
     failures = []
+    if not segments and not allow_empty:
+        failures.append("vocal_track_has_no_lyric_segments")
     if segments and voiced_coverage < 0.45:
         failures.append("vocal_activity_poorly_covered_by_lyrics")
     if segments and lyric_silence > 0.65:
@@ -123,13 +150,16 @@ def vocal_alignment(vocal: Path, segments: list[dict], duration: float) -> dict:
     }
 
 
-def lyric_metrics(transcript: dict, transcript_audit: dict) -> dict:
+def lyric_metrics(transcript: dict, transcript_audit: dict, *, allow_empty: bool = False) -> dict:
+    """Summarize lexical/timing evidence and reject unexplained empty drafts."""
     words = [word for segment in transcript.get("segments", []) for word in segment.get("words", [])]
     unexpected = [word for word in words if re.search(r"[^\x00-\x7f]", str(word.get("text", "")))]
     low_confidence = [word for word in words if float(word.get("probability") or 0) < 0.55]
     failures = list(transcript_audit["failures"])
     if unexpected:
         failures.append({"type": "unexpected_script", "count": len(unexpected)})
+    if not words and not allow_empty:
+        failures.append({"type": "vocal_track_has_no_words"})
     return {
         "word_count": len(words),
         "mean_word_probability": transcript.get("mean_word_probability"),
@@ -142,7 +172,8 @@ def lyric_metrics(transcript: dict, transcript_audit: dict) -> dict:
     }
 
 
-def pitch_metrics(karaoke_data: dict | None) -> dict:
+def pitch_metrics(karaoke_data: dict | None, *, allow_empty: bool = False) -> dict:
+    """Require note coverage for lyric-bearing tracks and explicit empty-track classification."""
     if not karaoke_data:
         return {"pass": False, "failures": ["karaoke_analysis_missing"]}
     words = karaoke_data.get("words", [])
@@ -150,8 +181,14 @@ def pitch_metrics(karaoke_data: dict | None) -> dict:
     pitched_words = {event.get("word_index") for event in events}
     ratio = len(pitched_words) / max(1, len(words))
     failures = []
-    if words and ratio < 0.45:
+    if not words and not allow_empty:
+        failures.append("vocal_track_has_no_pitch_words")
+    if words and ratio < 0.80:
         failures.append("insufficient_word_pitch_coverage")
+    if karaoke_data.get("detected_key", {}).get("status") != "verified_override":
+        failures.append("key_not_independently_verified")
+    if karaoke_data.get("rhythm", {}).get("meter", {}).get("status") != "verified_override":
+        failures.append("meter_not_independently_verified")
     return {
         "words": len(words),
         "note_events": len(events),
@@ -163,6 +200,7 @@ def pitch_metrics(karaoke_data: dict | None) -> dict:
 
 
 def remediation_regions(transcript: dict, transcript_audit: dict, padding: float = 1.5) -> list[dict]:
+    """Merge transcript failures into padded regions for targeted reprocessing."""
     bad_segments = sorted({int(item["segment"]) for item in transcript_audit["failures"] if "segment" in item})
     raw = []
     for index in bad_segments:
@@ -178,6 +216,7 @@ def remediation_regions(transcript: dict, transcript_audit: dict, padding: float
 
 
 def classify_remediation_regions(vocal: Path, regions: list[dict]) -> list[dict]:
+    """Classify whether failed regions contain enough vocal energy to retry."""
     if not regions:
         return []
     audio, sample_rate = sf.read(vocal, dtype="float32", always_2d=True)
@@ -202,36 +241,80 @@ def classify_remediation_regions(vocal: Path, regions: list[dict]) -> list[dict]
 
 
 def main() -> int:
+    """Run album-scale sonic, transcript, pitch, and evidence-binding gates."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--album-manifest", required=True, type=Path)
+    parser.add_argument("--source-root", required=True, type=Path)
+    parser.add_argument("--stem-root", required=True, type=Path)
     parser.add_argument("--transcripts", required=True, type=Path)
     parser.add_argument("--karaoke-data", type=Path)
+    parser.add_argument(
+        "--separation-review", type=Path,
+        help="JSON evidence with tracks.<number>.status=pass from independent listening or leakage analysis",
+    )
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     album = json.loads(args.album_manifest.read_text(encoding="utf-8"))
+    source_root = args.source_root.resolve(strict=True)
+    stem_root = args.stem_root.resolve(strict=True)
+    review_payload = json.loads(args.separation_review.read_text(encoding="utf-8")) if args.separation_review else {}
+    separation_reviews = review_payload.get("tracks", {})
     rows = []
     for track in album["tracks"]:
-        transcript_path = args.transcripts / f"{track['number']:02d} - {track['title']}.whisper.json"
+        safe_title = safe_component(track["title"], field=f"track {track['number']} title")
+        transcript_path = args.transcripts / f"{track['number']:02d} - {safe_title}.whisper.json"
         transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
+        classification = (transcript.get("lyric_classification") or {}).get("status")
+        explicitly_instrumental = classification == "instrumental_or_no_reliable_vocal"
         transcript_audit = audit_transcript(transcript_path)
         karaoke_path = args.karaoke_data / f"{track['number']:02d}.karaoke.json" if args.karaoke_data else None
         karaoke_data = json.loads(karaoke_path.read_text(encoding="utf-8")) if karaoke_path and karaoke_path.exists() else None
-        source_path = Path(album["config"]["source_dir"]) / track["source_file"]
-        sonic = sonic_metrics(source_path, Path(track["vocal_stem"]), Path(track["accompaniment_stem"]))
-        lyrics = lyric_metrics(transcript, transcript_audit)
-        alignment = vocal_alignment(Path(track["vocal_stem"]), transcript.get("segments", []), sonic["duration_seconds"])
-        pitch = pitch_metrics(karaoke_data)
+        source_path = (source_root / track["source_file"]).resolve(strict=True)
+        vocal_path = (stem_root / track["vocal_stem"]).resolve(strict=True)
+        accompaniment_path = (stem_root / track["accompaniment_stem"]).resolve(strict=True)
+        if not source_path.is_relative_to(source_root) or not vocal_path.is_relative_to(stem_root) or not accompaniment_path.is_relative_to(stem_root):
+            raise ValueError(f"track path escapes a trusted root: {track['title']}")
+        review = separation_reviews.get(str(track["number"]))
+        if review and (
+            review.get("track_type") not in {"vocal", "instrumental"}
+            or not review.get("notes")
+            or not review_payload.get("reviewer")
+            or not review_payload.get("method")
+        ):
+            review = {**review, "status": "invalid", "validation_error": "incomplete separation review evidence"}
+        sonic = sonic_metrics(source_path, vocal_path, accompaniment_path, review)
+        lyrics = lyric_metrics(transcript, transcript_audit, allow_empty=explicitly_instrumental)
+        alignment = vocal_alignment(
+            vocal_path, transcript.get("segments", []), sonic["duration_seconds"],
+            allow_empty=explicitly_instrumental,
+        )
+        pitch = pitch_metrics(karaoke_data, allow_empty=explicitly_instrumental)
         gates = {"sonic": sonic["pass"], "lyrics": lyrics["pass"], "alignment": alignment["pass"], "pitch": pitch["pass"]}
-        regions = classify_remediation_regions(Path(track["vocal_stem"]), remediation_regions(transcript, transcript_audit))
+        regions = classify_remediation_regions(vocal_path, remediation_regions(transcript, transcript_audit))
         rows.append({
             "track": track["number"], "title": track["title"], "gates": gates, "pass": all(gates.values()),
             "sonic": sonic, "lyrics": lyrics, "alignment": alignment, "pitch": pitch,
+            "evidence": {
+                "source_sha256": sha256(source_path),
+                "vocal_sha256": sha256(vocal_path),
+                "accompaniment_sha256": sha256(accompaniment_path),
+                "transcript_sha256": sha256(transcript_path),
+                "karaoke_data_sha256": sha256(karaoke_path) if karaoke_path and karaoke_path.exists() else None,
+            },
             "remediation_regions": regions,
         })
     report = {
         "schema": SCHEMA,
         "created_utc": datetime.now(UTC).isoformat(),
         "album_manifest": str(args.album_manifest),
+        "album_manifest_sha256": sha256(args.album_manifest),
+        "separation_review_sha256": sha256(args.separation_review) if args.separation_review else None,
+        "thresholds": {
+            "stem_reconstruction_error_db_max": -20,
+            "minimum_word_pitch_coverage": 0.80,
+            "minimum_active_vocal_coverage": 0.45,
+            "maximum_lyric_silence_fraction": 0.65,
+        },
         "tracks": rows,
         "summary": {gate: sum(row["gates"][gate] for row in rows) for gate in ("sonic", "lyrics", "alignment", "pitch")},
         "passing_tracks": sum(row["pass"] for row in rows),

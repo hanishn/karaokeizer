@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 def audit_transcript(path: Path) -> dict:
+    """Check one Whisper transcript for structural and timing pathologies."""
     data = json.loads(path.read_text(encoding="utf-8"))
     failures: list[dict] = []
     warnings: list[dict] = []
@@ -53,6 +54,7 @@ def audit_transcript(path: Path) -> dict:
 
 
 def main() -> int:
+    """Audit every candidate transcript and emit an aggregate JSON ledger."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", type=Path, help="Transcript JSON file or directory")
     parser.add_argument("--output", type=Path)

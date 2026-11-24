@@ -1,0 +1,13 @@
+{
+  "schema": "karaokeizer-separation-review/v1",
+  "method": "headphones_dual_listening",
+  "reviewer": "replace-with-reviewer-name",
+  "reviewed_utc": "2026-01-01T00:00:00Z",
+  "tracks": {
+    "1": {
+      "status": "pass",
+      "track_type": "vocal",
+      "notes": "No intelligible lead vocal detected in accompaniment; source and vocal stem cross-checked."
+    }
+  }
+}

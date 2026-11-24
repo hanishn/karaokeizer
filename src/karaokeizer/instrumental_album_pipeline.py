@@ -13,24 +13,31 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import importlib.metadata
 import json
-import re
 import shutil
 import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+import regex
+
+from .html_safety import json_for_script
+from .paths import safe_component
+
 SCHEMA = "instrumental-album-pipeline/v1"
 
 
 def command(args: list[str], *, capture: bool = True) -> subprocess.CompletedProcess[str]:
+    """Run an external tool and echo its exact command for reproducibility."""
     print("+", subprocess.list2cmdline(args), flush=True)
     return subprocess.run(args, check=True, text=True, capture_output=capture)
 
 
 def sha256(path: Path) -> str:
+    """Hash a file incrementally for manifests and checkpoint identities."""
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -39,11 +46,13 @@ def sha256(path: Path) -> str:
 
 
 def tool_version(executable: str) -> str:
+    """Read the first line of an FFmpeg-family tool's version output."""
     result = command([executable, "-version"])
     return result.stdout.splitlines()[0].strip()
 
 
 def audio_probe(path: Path, ffprobe: str) -> dict:
+    """Return normalized audio properties used by independent verification."""
     result = command(
         [
             ffprobe,
@@ -70,6 +79,7 @@ def audio_probe(path: Path, ffprobe: str) -> dict:
 
 
 def load_config(path: Path) -> dict:
+    """Load defaults and reject incomplete or unsafe configuration values."""
     config = json.loads(path.read_text(encoding="utf-8"))
     required = ["artist", "album", "source_dir", "output_dir", "work_dir"]
     missing = [name for name in required if not config.get(name)]
@@ -82,15 +92,23 @@ def load_config(path: Path) -> dict:
     config.setdefault("cover", "cover.jpg")
     config.setdefault("demucs_model", "htdemucs")
     config.setdefault("album_suffix", " (Instrumental)")
+    safe_component(config["album"], field="album")
     return config
 
 
 def source_tracks(config: dict) -> list[dict]:
+    """Discover source tracks while bounding user-configured regex runtime."""
     source_dir = Path(config["source_dir"])
-    pattern = re.compile(config["track_regex"], re.IGNORECASE)
+    expression = config["track_regex"]
+    if len(expression) > 1_000:
+        raise ValueError("track_regex may not exceed 1,000 characters")
+    pattern = regex.compile(expression, regex.IGNORECASE)
     tracks = []
     for path in sorted(source_dir.glob(config["source_glob"])):
-        match = pattern.search(path.name)
+        try:
+            match = pattern.search(path.name, timeout=0.05)
+        except TimeoutError as error:
+            raise ValueError("track_regex exceeded the 50 ms safety limit") from error
         if not match:
             raise ValueError(f"Source filename does not match track_regex: {path.name}")
         tracks.append(
@@ -109,10 +127,24 @@ def source_tracks(config: dict) -> list[dict]:
 
 
 def stem_dir(config: dict, source: Path) -> Path:
+    """Return the deterministic Demucs output directory for a source track."""
     return Path(config["work_dir"]) / config["demucs_model"] / source.stem
 
 
-def separate(config: dict, python: str) -> None:
+def separation_recipe(config: dict, source: Path) -> dict:
+    """Return the provenance identity required to resume a Demucs checkpoint."""
+
+    return {
+        "schema": "karaokeizer-demucs-checkpoint/v1",
+        "source_sha256": sha256(source),
+        "demucs_version": importlib.metadata.version("demucs"),
+        "model": config["demucs_model"],
+        "arguments": ["--two-stems=vocals", "--float32"],
+    }
+
+
+def separate(config: dict, python: str, *, force: bool = False) -> None:
+    """Create stems, resuming only when provenance and output hashes match."""
     work_dir = Path(config["work_dir"])
     work_dir.mkdir(parents=True, exist_ok=True)
     tracks = source_tracks(config)
@@ -120,9 +152,24 @@ def separate(config: dict, python: str) -> None:
         destination = stem_dir(config, row["source"])
         vocal = destination / "vocals.wav"
         accompaniment = destination / "no_vocals.wav"
+        checkpoint_path = destination / "karaokeizer-checkpoint.json"
+        recipe = separation_recipe(config, row["source"])
         if vocal.exists() and accompaniment.exists():
-            print(f"[{index}/{len(tracks)}] checkpoint exists: {row['title']}")
-            continue
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8")) if checkpoint_path.exists() else None
+            valid = bool(
+                checkpoint
+                and checkpoint.get("recipe") == recipe
+                and checkpoint.get("outputs", {}).get("vocals.wav") == sha256(vocal)
+                and checkpoint.get("outputs", {}).get("no_vocals.wav") == sha256(accompaniment)
+            )
+            if valid:
+                print(f"[{index}/{len(tracks)}] verified checkpoint exists: {row['title']}")
+                continue
+            if not force:
+                raise RuntimeError(
+                    f"stale or unverifiable stem checkpoint for {row['title']!r}; "
+                    "use a fresh work_dir or rerun with --force"
+                )
         print(f"[{index}/{len(tracks)}] separating: {row['title']}")
         command(
             [
@@ -141,36 +188,46 @@ def separate(config: dict, python: str) -> None:
         )
         if not vocal.exists() or not accompaniment.exists():
             raise RuntimeError(f"Demucs did not produce both stems for {row['source'].name}")
+        checkpoint_path.write_text(
+            json.dumps({
+                "recipe": recipe,
+                "outputs": {"vocals.wav": sha256(vocal), "no_vocals.wav": sha256(accompaniment)},
+            }, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
 
 def output_filename(row: dict) -> str:
-    return f"{row['number']:02d} - {row['title']} (Instrumental).flac"
+    """Return a portable output name derived from a validated track title."""
+    title = safe_component(row["title"], field=f"track {row['number']} title")
+    return f"{row['number']:02d} - {title} (Instrumental).flac"
 
 
 def write_player(output: Path, artist: str, album: str, tracks: list[dict]) -> None:
-    payload = json.dumps(
-        [{"file": row["output_file"], "title": row["title"]} for row in tracks],
-        ensure_ascii=False,
-    )
-    html = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+    """Generate the simple instrumental player with HTML-safe metadata."""
+    payload = json_for_script([{"file": row["output_file"], "title": row["title"]} for row in tracks])
+    safe_artist = html.escape(artist)
+    safe_album = html.escape(album)
+    html_document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{artist} — {album} (Instrumental)</title><style>
+<title>{safe_artist} — {safe_album} (Instrumental)</title><style>
 :root{{color-scheme:dark;font-family:system-ui,sans-serif}}body{{margin:0;background:#080b1b;color:#f5f2ff}}
 main{{width:min(920px,92vw);margin:2rem auto;display:grid;grid-template-columns:minmax(220px,340px) 1fr;gap:2rem}}
 img{{width:100%;border-radius:12px;box-shadow:0 16px 50px #0009}}audio{{width:100%;margin:.75rem 0 1rem}}
 button{{width:100%;text-align:left;color:inherit;background:transparent;border:0;padding:.6rem;border-radius:7px;cursor:pointer}}
 button:hover,li.active button{{background:#7c3aed44}}@media(max-width:700px){{main{{grid-template-columns:1fr}}}}
 </style></head><body><main><section><img src="cover.jpg" alt="Album cover"></section><section>
-<h1>{album} — Instrumental</h1><p>{artist} · locally separated accompaniment · FLAC</p>
+<h1>{safe_album} — Instrumental</h1><p>{safe_artist} · locally separated accompaniment · FLAC</p>
 <strong id="now">Select a track</strong><audio id="audio" controls preload="metadata"></audio><ol id="list"></ol>
 </section></main><script>const tracks={payload};let current=0;const audio=document.getElementById('audio'),list=document.getElementById('list'),now=document.getElementById('now');
 function load(i,play=true){{current=(i+tracks.length)%tracks.length;audio.src=tracks[current].file;now.textContent=`${{current+1}}. ${{tracks[current].title}}`;[...list.children].forEach((li,n)=>li.classList.toggle('active',n===current));if(play)audio.play().catch(()=>{{}})}}
 tracks.forEach((t,i)=>{{const li=document.createElement('li'),b=document.createElement('button');b.textContent=t.title;b.onclick=()=>load(i);li.appendChild(b);list.appendChild(li)}});audio.addEventListener('ended',()=>{{if(current+1<tracks.length)load(current+1)}});load(0,false);
 </script></body></html>"""
-    (output / f"{album} - Instrumental.html").write_text(html, encoding="utf-8")
+    (output / f"{album} - Instrumental.html").write_text(html_document, encoding="utf-8")
 
 
 def package(config: dict, ffmpeg: str, ffprobe: str, *, force: bool) -> Path:
+    """Encode accompaniment stems and write the portable album manifest."""
     output = Path(config["output_dir"])
     output.mkdir(parents=True, exist_ok=True)
     cover = Path(config["source_dir"]) / config["cover"]
@@ -178,6 +235,7 @@ def package(config: dict, ffmpeg: str, ffprobe: str, *, force: bool) -> Path:
         raise FileNotFoundError(cover)
     shutil.copy2(cover, output / "cover.jpg")
     tracks = source_tracks(config)
+    work_root = Path(config["work_dir"]).resolve()
     manifest_tracks = []
     for row in tracks:
         stem = stem_dir(config, row["source"]) / "no_vocals.wav"
@@ -235,9 +293,9 @@ def package(config: dict, ffmpeg: str, ffprobe: str, *, force: bool) -> Path:
                 "source_file": row["source"].name,
                 "source_sha256": sha256(row["source"]),
                 "source_audio": source_audio,
-                "accompaniment_stem": str(stem),
+                "accompaniment_stem": stem.resolve().relative_to(work_root).as_posix(),
                 "accompaniment_sha256": sha256(stem),
-                "vocal_stem": str(vocal),
+                "vocal_stem": vocal.resolve().relative_to(work_root).as_posix(),
                 "vocal_sha256": sha256(vocal),
                 "output_file": filename,
                 "output_sha256": sha256(destination),
@@ -251,7 +309,7 @@ def package(config: dict, ffmpeg: str, ffprobe: str, *, force: bool) -> Path:
     manifest = {
         "schema": SCHEMA,
         "created_utc": datetime.now(UTC).isoformat(),
-        "config": config,
+        "config": {key: value for key, value in config.items() if key not in {"source_dir", "output_dir", "work_dir"}},
         "tools": {
             "python": sys.version.splitlines()[0],
             "demucs": importlib.metadata.version("demucs"),
@@ -270,6 +328,7 @@ def package(config: dict, ffmpeg: str, ffprobe: str, *, force: bool) -> Path:
 
 
 def verify(config: dict, ffprobe: str) -> dict:
+    """Re-hash and re-probe packaged artifacts independently of encoding."""
     output = Path(config["output_dir"])
     manifest_path = output / "pipeline-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -328,6 +387,7 @@ def verify(config: dict, ffprobe: str) -> dict:
 
 
 def main() -> int:
+    """Dispatch the separate, package, verify, or complete album stage."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=["separate", "package", "verify", "all"])
     parser.add_argument("--config", required=True, type=Path)
@@ -338,7 +398,7 @@ def main() -> int:
     args = parser.parse_args()
     config = load_config(args.config)
     if args.stage in {"separate", "all"}:
-        separate(config, args.python)
+        separate(config, args.python, force=args.force)
     if args.stage in {"package", "all"}:
         package(config, args.ffmpeg, args.ffprobe, force=args.force)
     if args.stage in {"verify", "all"}:

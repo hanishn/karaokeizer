@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 def merged_regions(failures: list[dict], padding: float, gap: float) -> list[dict]:
+    """Coalesce nearby failures into bounded retranscription regions."""
     spans = []
     for failure in failures:
         start = float(failure.get("start", failure.get("segment_start", 0)))
@@ -27,6 +28,7 @@ def merged_regions(failures: list[dict], padding: float, gap: float) -> list[dic
 
 
 def main() -> int:
+    """Build an immutable escalation ledger from transcript audit failures."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--audit", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)

@@ -10,6 +10,8 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .paths import safe_component
+
 SCHEMA = "karaoke-whisper-transcript/v1"
 
 
@@ -24,7 +26,8 @@ def sha256(path: Path) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--album-manifest", required=True, type=Path)
-    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--stem-root", required=True, type=Path)
+    parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--model", default="large-v3")
     parser.add_argument("--backend", choices=["openai", "faster-whisper"], default="openai")
     parser.add_argument("--device", default="cpu")
@@ -39,13 +42,28 @@ def main() -> int:
 
     album = json.loads(args.album_manifest.read_text(encoding="utf-8"))
     config = album["config"]
-    output = args.output_dir or Path(config["output_dir"]) / "karaoke" / "transcripts"
+    stem_root = args.stem_root.resolve(strict=True)
+    output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
     tracks = [track for track in album["tracks"] if track["number"] >= args.start_track]
     selected = {int(value) for value in args.tracks.split(",") if value.strip()}
     if selected:
         tracks = [track for track in tracks if track["number"] in selected]
     tracks = tracks[: args.limit or None]
+    package_name = "faster-whisper" if args.backend == "faster-whisper" else "openai-whisper"
+    package_version = importlib.metadata.version(package_name)
+    decode_identity = {
+        "backend": args.backend,
+        "package_version": package_version,
+        "model": args.model,
+        "device": args.device,
+        "compute_type": args.compute_type,
+        "beam_size": args.beam_size,
+        "language": "en",
+        "word_timestamps": True,
+        "condition_on_previous_text": True,
+        "initial_prompt_sha256": hashlib.sha256(args.initial_prompt.encode("utf-8")).hexdigest(),
+    }
     if args.backend == "faster-whisper":
         from faster_whisper import WhisperModel
 
@@ -57,20 +75,22 @@ def main() -> int:
     index = []
 
     for position, track in enumerate(tracks, 1):
-        vocal = Path(track["vocal_stem"])
+        vocal = (stem_root / track["vocal_stem"]).resolve(strict=True)
+        if not vocal.is_relative_to(stem_root):
+            raise ValueError(f"vocal stem escapes --stem-root: {track['vocal_stem']}")
         vocal_hash = sha256(vocal)
-        destination = output / f"{track['number']:02d} - {track['title']}.whisper.json"
+        safe_title = safe_component(track["title"], field=f"track {track['number']} title")
+        destination = output / f"{track['number']:02d} - {safe_title}.whisper.json"
         if destination.exists() and not args.force:
             existing = json.loads(destination.read_text(encoding="utf-8"))
-            if (
-                existing.get("vocal_sha256") == vocal_hash
-                and existing.get("whisper", {}).get("model") == args.model
-                and existing.get("whisper", {}).get("backend") == args.backend
-                and existing.get("whisper", {}).get("compute_type") == args.compute_type
-            ):
+            if existing.get("vocal_sha256") == vocal_hash and existing.get("decode_identity") == decode_identity:
                 print(f"[{position}/{len(tracks)}] checkpoint exists: {track['title']}")
                 index.append(existing)
                 continue
+            raise RuntimeError(
+                f"candidate identity mismatch for {track['title']!r}; "
+                "write to a fresh output directory or use --force explicitly"
+            )
         print(f"[{position}/{len(tracks)}] transcribing: {track['title']}", flush=True)
         prompt = args.initial_prompt or None
         if args.backend == "faster-whisper":
@@ -127,11 +147,12 @@ def main() -> int:
             "title": track["title"],
             "artist": config["artist"],
             "album": config["album"],
-            "vocal_stem": str(vocal),
+            "vocal_stem": track["vocal_stem"],
             "vocal_sha256": vocal_hash,
+            "decode_identity": decode_identity,
             "whisper": {
                 "backend": args.backend,
-                "package_version": importlib.metadata.version("faster-whisper" if args.backend == "faster-whisper" else "openai-whisper"),
+                "package_version": package_version,
                 "model": args.model,
                 "device": args.device,
                 "compute_type": args.compute_type,

@@ -4,15 +4,22 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
-import shutil
 from datetime import UTC, datetime
 from pathlib import Path
+
+from .remediate_karaoke_regions import (
+    normalize_stats,
+    replacement_segments,
+    retained_segments_outside_region,
+    validate_merged_timeline,
+    validate_replacement,
+)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--transcript", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path, help="Fresh candidate path; input is never overwritten")
     parser.add_argument("--vocal", required=True, type=Path)
     parser.add_argument("--start", required=True, type=float)
     parser.add_argument("--end", required=True, type=float)
@@ -20,6 +27,8 @@ def main() -> int:
     parser.add_argument("--beam-size", type=int, default=8)
     args = parser.parse_args()
     import whisper
+    if args.output.exists():
+        parser.error("output candidate already exists; choose a fresh path")
     if args.start < 0 or args.end <= args.start:
         parser.error("segment must satisfy 0 <= start < end")
 
@@ -37,39 +46,16 @@ def main() -> int:
         beam_size=args.beam_size,
         temperature=0,
     )
-    replacement = []
-    for segment in result["segments"]:
-        words = [
-            {
-                "text": word["word"].strip(),
-                "start": round(float(word["start"]) + args.start, 3),
-                "end": round(float(word["end"]) + args.start, 3),
-                "probability": round(float(word.get("probability", 0)), 6),
-            }
-            for word in segment.get("words", [])
-        ]
-        if words:
-            replacement.append(
-                {
-                    "start": round(float(segment["start"]) + args.start, 3),
-                    "end": round(float(segment["end"]) + args.start, 3),
-                    "text": segment["text"].strip(),
-                    "avg_logprob": round(float(segment.get("avg_logprob", 0)), 6),
-                    "no_speech_probability": round(float(segment.get("no_speech_prob", 0)), 6),
-                    "words": words,
-                }
-            )
-
-    retained = [s for s in transcript["segments"] if float(s["end"]) <= args.start or float(s["start"]) >= args.end]
-    transcript["segments"] = sorted(retained + replacement, key=lambda segment: float(segment["start"]))
-    words = [word for segment in transcript["segments"] for word in segment["words"]]
-    transcript["text"] = " ".join(segment["text"] for segment in transcript["segments"])
-    transcript["word_count"] = len(words)
-    transcript["mean_word_probability"] = round(sum(float(w["probability"]) for w in words) / len(words), 6)
-    transcript["low_confidence_words"] = [w for w in words if float(w["probability"]) < 0.55]
-    normalized = [re.sub(r"[^a-z0-9']", "", w["text"].lower()) for w in words]
-    normalized = [word for word in normalized if word]
-    transcript["repetition_ratio"] = round(max(normalized.count(w) for w in set(normalized)) / len(normalized), 6)
+    replacement = replacement_segments(result, args.start)
+    failures = validate_replacement(replacement, args.start, args.end)
+    retained = retained_segments_outside_region(transcript["segments"], args.start, args.end)
+    merged = sorted(retained + replacement, key=lambda segment: float(segment["start"]))
+    failures.extend(validate_merged_timeline(merged))
+    if failures:
+        print(json.dumps({"pass": False, "failures": sorted(set(failures))}, indent=2))
+        return 1
+    transcript["segments"] = merged
+    normalize_stats(transcript)
     transcript.setdefault("repairs", []).append(
         {
             "repaired_utc": datetime.now(UTC).isoformat(),
@@ -81,11 +67,9 @@ def main() -> int:
             "replacement_segments": len(replacement),
         }
     )
-    backup = args.transcript.with_suffix(".pre-segment-repair.json")
-    if not backup.exists():
-        shutil.copy2(args.transcript, backup)
-    args.transcript.write_text(json.dumps(transcript, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({"transcript": str(args.transcript), "backup": str(backup), "replacement_segments": len(replacement), "words": len(words)}, indent=2))
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(transcript, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({"pass": True, "candidate": str(args.output), "replacement_segments": len(replacement), "words": transcript["word_count"]}, indent=2))
     return 0
 
 

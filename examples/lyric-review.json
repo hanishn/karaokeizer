@@ -1,0 +1,14 @@
+{
+  "schema": "karaokeizer-lyric-review/v1",
+  "pass": false,
+  "reviewer": "replace-with-reviewer-name",
+  "reviewed_utc": "2026-01-01T00:00:00Z",
+  "method": "authorized_reference_and_listening_review",
+  "tracks": {
+    "1": {
+      "status": "pass",
+      "transcript_sha256": "replace-with-reviewed-candidate-hash",
+      "notes": "Every word and disputed timing region reviewed."
+    }
+  }
+}
