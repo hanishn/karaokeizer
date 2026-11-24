@@ -42,8 +42,8 @@ def prepare(source: Path, output: Path) -> Path:
     commit = run(["git", "rev-parse", "HEAD"], source).stdout.strip()
     if commit != PINNED_SSLI_COMMIT:
         raise ValueError(f"SSLI checkout must be pinned to {PINNED_SSLI_COMMIT}; found {commit}")
-    if run(["git", "status", "--porcelain", "--untracked-files=no"], source).stdout.strip():
-        raise ValueError("SSLI checkout has tracked modifications; use a pristine checkout")
+    if run(["git", "status", "--porcelain"], source).stdout.strip():
+        raise ValueError("SSLI checkout has modified or untracked files; use a pristine checkout")
     patch = Path(str(files("karaokeizer").joinpath("data/ssli-formant-scheduler.patch")))
     run(["git", "apply", "--check", str(patch)], source)
     output.mkdir(parents=True, exist_ok=True)
@@ -73,7 +73,7 @@ def prepare(source: Path, output: Path) -> Path:
         return output
     finally:
         if applied:
-            run(["git", "apply", "--reverse", str(patch)], source, check=False)
+            run(["git", "apply", "--reverse", str(patch)], source)
 
 
 def main() -> int:
