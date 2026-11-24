@@ -65,8 +65,8 @@ def test_visual_audit_exercises_the_hash_bound_served_player(tmp_path: Path, mon
     track = {
         "title": "Song", "audio": "audio.wav",
         "segments": [{"start": 0.1, "end": 0.8, "text": "hello", "words": []}],
-        "words": [{"text": "hello", "start": 0.1, "end": 0.8, "word_index": 0}],
-        "note_events": [{"start": 0.1, "end": 0.8, "midi": 60, "note": "C4", "word_index": 0}],
+        "words": [{"text": "hello", "start": 5.0, "end": 5.2, "word_index": 0}],
+        "note_events": [{"start": 5.0, "end": 5.2, "midi": 60, "note": "C4", "word_index": 0}],
         "detected_key": {"status": "confident", "label": "C major", "display": "C major", "confidence": 1.0,
                          "runner_up": {}, "tonic": "C", "mode": "major"},
         "rhythm": {"meter": {"numerator": 4, "denominator": 4}, "measures": [{"start": 0.0, "end": 1.0}],
@@ -130,9 +130,9 @@ def test_real_ssli_formant_worklet_is_audible_and_sample_scheduled(tmp_path: Pat
             {"start": 0.1, "end": 0.35, "midi": 60, "note": "C4", "word_index": 0},
             {"start": 2.0, "end": 2.3, "midi": 64, "note": "E4", "word_index": None},
         ] + [
-            {"start": 10.0 + index * 0.05, "end": 10.04 + index * 0.05,
+            {"start": 0.4 + index * 0.00025, "end": 0.4005 + index * 0.00025,
              "midi": 60 + index % 12, "note": "dense", "word_index": None}
-            for index in range(1_000)
+            for index in range(9_000)
         ],
         "detected_key": {"status": "confident", "label": "C major", "display": "C major", "confidence": 1.0,
                          "runner_up": {}, "tonic": "C", "mode": "major"},
@@ -165,11 +165,13 @@ def test_real_ssli_formant_worklet_is_audible_and_sample_scheduled(tmp_path: Pat
     guide = json.loads(output.read_text(encoding="utf-8"))["guide_voice"]
     assert guide["pass"] is True
     assert {event["state"] for event in guide["workletTelemetry"]} >= {"scheduled", "started", "released", "cancelled"}
-    assert sum(event["state"] == "started" for event in guide["workletTelemetry"]) == 2
-    assert sum(event["state"] == "released" for event in guide["workletTelemetry"]) == 2
+    assert sum(event["state"] == "started" for event in guide["workletTelemetry"]) >= 9_002
+    assert sum(event["state"] == "released" for event in guide["workletTelemetry"]) >= 2
     assert max(event.get("peak", 0) for event in guide["workletTelemetry"]) > 1e-6
     track_evidence = json.loads(output.read_text(encoding="utf-8"))["tracks"][0]["guideEvidence"]
-    assert track_evidence["expectedScheduled"] == 1_002
-    assert 1_002 in track_evidence["scheduleBatches"].values()
-    assert track_evidence["audibleReleased"] == 2
+    assert track_evidence["expectedScheduled"] == 9_002
+    assert 9_002 in track_evidence["scheduleBatches"].values()
+    assert track_evidence["started"] == 9_002
+    assert track_evidence["audibleReleased"] == track_evidence["released"]
+    assert track_evidence["audibleReleased"] >= 2
     assert track_evidence["pass"] is True

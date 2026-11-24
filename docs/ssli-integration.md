@@ -18,6 +18,8 @@ cancelSchedule(scheduleId, instrumentId)
 Each note contains `midi`, `velocity`, `startTime`, and `endTime`; times are
 absolute seconds on SSLI's `AudioContext` clock. A batch is bounded to 10,000
 notes and two hours, validated on both threads, and sorted only once.
+The integration retains up to 40,000 lifecycle telemetry records, enough to
+attest a maximum batch's scheduled, started, released, and cancelled states.
 The implementation must enqueue the events in SSLI's formant AudioWorklet and
 render them with the selected formant instrument. It must not translate them
 into main-thread `setTimeout` calls or a generic oscillator substitute.

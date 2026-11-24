@@ -124,6 +124,18 @@ def main() -> int:
                 positions = [round(i * (len(segments) - 1) / max(1, args.samples_per_track - 1)) for i in range(args.samples_per_track)]
                 sample_times = [round((segments[index]["start"] + segments[index]["end"]) / 2, 3) for index in sorted(set(positions))]
             sample_times = sorted(set(sample_times + extra_samples.get(track["index"] + 1, [])))
+            guide_wait_ms = 500
+            if track["noteEvents"]:
+                guide_note = min(
+                    track["noteEvents"],
+                    key=lambda note: (round(note["end"] - note["start"], 6), note["start"]),
+                )
+                guide_time = max(0.0, guide_note["start"] - 0.25)
+                guide_wait_ms = round((guide_note["end"] - guide_time) * 1_000) + 200
+                if guide_wait_ms > 10_000:
+                    guide_time = max(0.0, guide_note["end"] - 0.5)
+                    guide_wait_ms = 700
+                sample_times = [guide_time] + [time for time in sample_times if abs(time - guide_time) > 0.001]
             samples = []
             for sample_index, time in enumerate(sample_times, 1):
                 page.evaluate("index => { load(index, false); audio.load(); }", track["index"])
@@ -164,20 +176,23 @@ def main() -> int:
                 result["mediaReady"] = media_ready
                 result["mediaError"] = media_error
                 if sample_index == 1 and media_ready:
-                    result["playbackAdvanced"] = page.evaluate(
-                        """async stallMs => {
-                            const before=audio.currentTime;
-                            try { await audio.play(); } catch { return false; }
-                            if(stallMs>0){const until=performance.now()+stallMs;while(performance.now()<until){}}
-                            await new Promise(resolve=>setTimeout(resolve,500));
+                    playback = page.evaluate(
+                        """async options => {
+                             const before=audio.currentTime;
+                             try { await audio.play(); } catch { return {advanced:false,before}; }
+                             if(options.stallMs>0){const until=performance.now()+options.stallMs;while(performance.now()<until){}}
+                             await new Promise(resolve=>setTimeout(resolve,options.waitMs));
                             const advanced=audio.currentTime>before+0.05;
                             audio.pause();
-                            return advanced;
+                             return {advanced,before};
                         }""",
-                        args.main_thread_stall_ms,
+                        {"stallMs": args.main_thread_stall_ms, "waitMs": guide_wait_ms},
                     )
+                    result["playbackAdvanced"] = playback["advanced"]
+                    result["playbackStart"] = playback["before"]
                 else:
                     result["playbackAdvanced"] = True
+                    result["playbackStart"] = time
                 screenshot = args.evidence_dir / f"{track['index'] + 1:02d}-{safe_name(track['title'])}-{sample_index}.png"
                 page.locator("#staff").screenshot(path=str(screenshot))
                 result["screenshot"] = str(screenshot)
@@ -203,42 +218,47 @@ def main() -> int:
         )
         worklet_states = {event.get("state") for event in worklet_telemetry}
         worklet_rejections = [event for event in worklet_telemetry if event.get("state") == "rejected"]
-        timing_events = [event for event in worklet_telemetry if event.get("state") in {"started", "released"}]
-        timing_within_quantum = all(
-            abs(event.get("actualFrame", 0) - event.get("requestedFrame", 0)) <= 128 for event in timing_events
-        )
-        audible_releases = [event for event in worklet_telemetry if event.get("state") == "released" and event.get("peak", 0) > 1e-6]
         expected_guide_notes = sum(track["noteCount"] for track in inventory)
         track_guide_passes = []
+        verified_events = []
         for row, track in zip(rows, inventory, strict=True):
             prefix = f"karaoke-{track['index']}-"
             events = [event for event in worklet_telemetry if str(event.get("scheduleId", "")).startswith(prefix)]
-            first_time = row["samples"][0]["time"] if row["samples"] else 0.0
+            first_time = row["samples"][0]["playbackStart"] if row["samples"] else 0.0
             expected = sum(note["end"] > first_time for note in track["noteEvents"])
             scheduled = [event for event in events if event.get("state") == "scheduled"]
-            started = [event for event in events if event.get("state") == "started"]
-            released = [event for event in events if event.get("state") == "released"]
             rejected = [event for event in events if event.get("state") == "rejected"]
-            audible = [event for event in released if event.get("peak", 0) > 1e-6]
-            should_sound = any(
-                note["end"] > first_time and note["start"] < first_time + (args.main_thread_stall_ms + 500) / 1_000
-                for note in track["noteEvents"]
-            )
             batch_counts: dict[str, int] = {}
             for event in scheduled:
                 schedule_id = str(event.get("scheduleId", ""))
                 batch_counts[schedule_id] = batch_counts.get(schedule_id, 0) + 1
+            candidate_ids = [schedule_id for schedule_id, count in batch_counts.items() if count == expected]
+            verified_schedule_id = max(
+                candidate_ids,
+                key=lambda schedule_id: (
+                    sum(event.get("state") == "released" for event in events if event.get("scheduleId") == schedule_id),
+                    sum(event.get("state") == "started" for event in events if event.get("scheduleId") == schedule_id),
+                ),
+                default=None,
+            )
+            lifecycle = [event for event in events if event.get("scheduleId") == verified_schedule_id]
+            verified_events.extend(lifecycle)
+            started = [event for event in lifecycle if event.get("state") == "started"]
+            released = [event for event in lifecycle if event.get("state") == "released"]
+            audible = [event for event in released if event.get("peak", 0) > 1e-6]
             track_pass = (
-                (expected == 0 or expected in batch_counts.values())
+                (expected == 0 or verified_schedule_id is not None)
                 and not rejected
                 and len(audible) == len(released)
-                and (not should_sound or bool(started))
-                and (not should_sound or bool(released))
+                and (expected == 0 or bool(started))
+                and (expected == 0 or bool(released))
+                and (expected == 0 or bool(audible))
             )
             row["guideEvidence"] = {
                 "expectedScheduled": expected,
                 "scheduled": len(scheduled),
                 "scheduleBatches": batch_counts,
+                "verifiedScheduleId": verified_schedule_id,
                 "started": len(started),
                 "released": len(released),
                 "audibleReleased": len(audible),
@@ -249,6 +269,13 @@ def main() -> int:
                 row["failures"].append("guide_voice_track_evidence_failed")
                 row["pass"] = False
             track_guide_passes.append(track_pass)
+        timing_events = [event for event in verified_events if event.get("state") in {"started", "released"}]
+        timing_within_quantum = all(
+            abs(event.get("actualFrame", 0) - event.get("requestedFrame", 0)) <= 128 for event in timing_events
+        )
+        audible_releases = [
+            event for event in verified_events if event.get("state") == "released" and event.get("peak", 0) > 1e-6
+        ]
         guide_state["telemetry"] = guide_telemetry
         guide_state["workletTelemetry"] = worklet_telemetry
         guide_state["pass"] = (

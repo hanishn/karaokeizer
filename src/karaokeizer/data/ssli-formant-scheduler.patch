@@ -31,7 +31,7 @@ index 4bd7339..ac12d85 100644
          }
 +      } else if (event.data.type === 'scheduleTelemetry') {
 +        scheduleTelemetry.push(event.data);
-+        if (scheduleTelemetry.length > 10000) { scheduleTelemetry.shift(); }
++        if (scheduleTelemetry.length > 40000) { scheduleTelemetry.shift(); }
        }
      };
    }
@@ -136,11 +136,12 @@ diff --git a/shared/assets/worklets/formant-worklet.js b/shared/assets/worklets/
 index 95992e3..33727db 100644
 --- a/shared/assets/worklets/formant-worklet.js
 +++ b/shared/assets/worklets/formant-worklet.js
-@@ -416,6 +416,7 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
+@@ -416,6 +416,8 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
  
      // Custom vowel support
      this.customVowelData = null;
 +    this.scheduledEvents = [];
++    this.scheduledEventIndex = 0;
  
      this.port.onmessage = this.handleMessage.bind(this);
      this.port.postMessage({ type: 'ready' });
@@ -174,7 +175,7 @@ index 95992e3..33727db 100644
    }
  
    onNoteOff(midi) {
-@@ -485,6 +502,77 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
+@@ -485,6 +502,81 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
      }
    }
  
@@ -183,8 +184,9 @@ index 95992e3..33727db 100644
 +  }
 +
 +  onScheduleNotes(events) {
++    var pendingCount = this.scheduledEvents.length - this.scheduledEventIndex;
 +    if (!Array.isArray(events) || events.length < 1 || events.length > 10000 ||
-+        this.scheduledEvents.length + events.length * 2 > 20000) {
++        pendingCount + events.length * 2 > 20000) {
 +      this.port.postMessage({ type: 'scheduleTelemetry', state: 'rejected', reason: 'schedule_capacity' });
 +      return;
 +    }
@@ -205,7 +207,8 @@ index 95992e3..33727db 100644
 +      additions.push({ frame: data.startFrame, order: 1, action: 'start', data: data });
 +      additions.push({ frame: data.endFrame, order: 0, action: 'release', data: data });
 +    }
-+    this.scheduledEvents = this.scheduledEvents.concat(additions);
++    this.scheduledEvents = this.scheduledEvents.slice(this.scheduledEventIndex).concat(additions);
++    this.scheduledEventIndex = 0;
 +    this.scheduledEvents.sort(function(a, b) { return a.frame - b.frame || a.order - b.order; });
 +    for (var j = 0; j < events.length; j++) {
 +      this.port.postMessage({
@@ -216,10 +219,12 @@ index 95992e3..33727db 100644
 +  }
 +
 +  onCancelSchedule(scheduleId) {
-+    var before = this.scheduledEvents.length;
-+    this.scheduledEvents = this.scheduledEvents.filter(function(event) {
++    var pending = this.scheduledEvents.slice(this.scheduledEventIndex);
++    var before = pending.length;
++    this.scheduledEvents = pending.filter(function(event) {
 +      return event.data.scheduleId !== scheduleId;
 +    });
++    this.scheduledEventIndex = 0;
 +    var active = 0;
 +    for (var i = 0; i < this.voices.length; i++) {
 +      var voice = this.voices[i];
@@ -252,13 +257,14 @@ index 95992e3..33727db 100644
    onUpdateSettings(data) {
      if (data.vowel !== undefined) { this.vowel = data.vowel; }
      if (data.vowelTarget !== undefined) { this.vowelTarget = data.vowelTarget; }
-@@ -561,10 +649,26 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
+@@ -561,10 +654,31 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
      var PER_VOICE_BASE_GAIN = 0.75;
  
      for (var s = 0; s < blockSize; s++) {
 +      var absoluteFrame = currentFrame + s;
-+      while (this.scheduledEvents.length && this.scheduledEvents[0].frame <= absoluteFrame) {
-+        var scheduled = this.scheduledEvents.shift();
++      while (this.scheduledEventIndex < this.scheduledEvents.length &&
++             this.scheduledEvents[this.scheduledEventIndex].frame <= absoluteFrame) {
++        var scheduled = this.scheduledEvents[this.scheduledEventIndex++];
 +        if (scheduled.action === 'start') {
 +          this.onNoteOn(scheduled.data);
 +          this.port.postMessage({
@@ -269,6 +275,10 @@ index 95992e3..33727db 100644
 +        } else {
 +          this.releaseScheduledEvent(scheduled.data, absoluteFrame);
 +        }
++      }
++      if (this.scheduledEventIndex === this.scheduledEvents.length) {
++        this.scheduledEvents = [];
++        this.scheduledEventIndex = 0;
 +      }
        var sample = 0;
        for (var vi2 = 0; vi2 < this.voices.length; vi2++) {
