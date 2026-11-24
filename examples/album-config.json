@@ -1,0 +1,14 @@
+{
+  "artist": "Artist Name",
+  "album": "Album Name",
+  "year": "2026",
+  "genre": "Synthwave",
+  "source_dir": "C:\\Path\\To\\Purchased Album",
+  "source_glob": "*.wav",
+  "track_regex": " - (?P<number>\\d{2}) (?P<title>.+)\\.wav$",
+  "cover": "cover.jpg",
+  "work_dir": "C:\\Path\\To\\Checkpointed Work Directory",
+  "output_dir": "C:\\Path\\To\\Instrumental Album Output",
+  "demucs_model": "htdemucs",
+  "album_suffix": " (Instrumental)"
+}
