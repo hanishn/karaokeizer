@@ -6,9 +6,23 @@ import re
 import subprocess
 from pathlib import Path
 
-FORBIDDEN_SUFFIXES = {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".opus", ".safetensors", ".pt", ".pth"}
+FORBIDDEN_SUFFIXES = {
+    ".wav", ".flac", ".mp3", ".m4a", ".ogg", ".opus",
+    ".safetensors", ".pt", ".pth", ".m3u", ".m3u8",
+}
+FORBIDDEN_NAMES = {
+    "pipeline-manifest.json", "verification-report.json", "karaoke-verification.json",
+    "album-qa-ledger.json", "player-visual-audit.json", "transcript-consensus.json",
+    "transcription-index.json", "remediation-summary.json",
+}
+FORBIDDEN_NAME_PATTERNS = (
+    re.compile(r".* - (?:Karaoke|Instrumental)\.html$", re.IGNORECASE),
+    re.compile(r".*\.(?:whisper|karaoke)\.json$", re.IGNORECASE),
+    re.compile(r"cover\.(?:jpe?g|png|webp)$", re.IGNORECASE),
+)
 TEXT_PATTERNS = {
-    "private Windows user path": re.compile(r"[A-Za-z]:\\Users\\[^\\\s]+", re.IGNORECASE),
+    "private Windows path": re.compile(r"[A-Za-z]:[\\/](?:Users|Music|Downloads|Documents|Desktop)[\\/][^\s<]+", re.IGNORECASE),
+    "private POSIX home path": re.compile(r"/(?:home|Users)/[^/\s<]+/[^\s<]+"),
     "GitHub token": re.compile(r"\b(?:gho|ghp|github_pat)_[A-Za-z0-9_]+"),
     "private key": re.compile(r"-----BEGIN (?:RSA |OPENSSH )?PRIVATE KEY-----"),
 }
@@ -22,6 +36,8 @@ def main() -> int:
         path = Path(name)
         if path.suffix.lower() in FORBIDDEN_SUFFIXES:
             failures.append(f"forbidden tracked artifact: {name}")
+        if path.name.lower() in FORBIDDEN_NAMES or any(pattern.fullmatch(path.name) for pattern in FORBIDDEN_NAME_PATTERNS):
+            failures.append(f"forbidden generated artifact: {name}")
         if path.stat().st_size > MAX_TRACKED_BYTES:
             failures.append(f"tracked file exceeds 2 MiB: {name}")
         try:

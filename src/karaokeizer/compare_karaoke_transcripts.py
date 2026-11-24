@@ -10,12 +10,14 @@ from pathlib import Path
 
 
 def sha256(path: Path) -> str:
+    """Hash a transcript so the consensus ledger binds exact candidates."""
     digest = hashlib.sha256()
     digest.update(path.read_bytes())
     return digest.hexdigest()
 
 
 def normalized_words(data: dict, start: float | None = None, end: float | None = None) -> list[str]:
+    """Return normalized lyric tokens, optionally intersecting a time range."""
     return [
         normalized
         for segment in data.get("segments", [])
@@ -26,6 +28,7 @@ def normalized_words(data: dict, start: float | None = None, end: float | None =
 
 
 def edit_distance(left: list[str], right: list[str]) -> int:
+    """Compute token-level Levenshtein distance with one-row memory."""
     previous = list(range(len(right) + 1))
     for row, left_word in enumerate(left, 1):
         current = [row]
@@ -36,6 +39,7 @@ def edit_distance(left: list[str], right: list[str]) -> int:
 
 
 def main() -> int:
+    """Compare independent transcript runs globally and in repaired regions."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--primary", required=True, type=Path)
     parser.add_argument("--candidate", required=True, type=Path)
@@ -55,6 +59,15 @@ def main() -> int:
         candidate_instrumental = (candidate_data.get("lyric_classification") or {}).get("status") == "instrumental_or_no_reliable_vocal"
         distance = edit_distance(primary_words, candidate_words)
         disagreement = distance / max(1, max(len(primary_words), len(candidate_words)))
+        primary_hash, candidate_hash = sha256(primary_path), sha256(candidate_path)
+        primary_identity = primary_data.get("decode_identity")
+        candidate_identity = candidate_data.get("decode_identity")
+        independent = (
+            primary_hash != candidate_hash
+            and bool(primary_identity)
+            and bool(candidate_identity)
+            and primary_identity != candidate_identity
+        )
         remediations = candidate_data.get("qa_remediation", [])
         regions = remediations[-1].get("regions", []) if remediations else []
         region_rows = []
@@ -72,19 +85,36 @@ def main() -> int:
                 "pass": region_disagreement <= args.max_disagreement,
             })
         content_valid = bool(primary_words and candidate_words) or (primary_instrumental and candidate_instrumental)
-        regional_pass = (all(region["pass"] for region in region_rows) if region_rows else disagreement <= args.max_disagreement) and content_valid
+        # Repaired-region agreement is additional evidence, never a substitute
+        # for album-wide agreement.  The two candidates must also be genuinely
+        # independent runs; comparing a file with itself proves nothing.
+        regional_pass = all(region["pass"] for region in region_rows)
+        consensus_pass = (
+            content_valid
+            and independent
+            and disagreement <= args.max_disagreement
+            and regional_pass
+        )
         rows.append({
             "file": primary_path.name,
-            "primary_sha256": sha256(primary_path),
-            "candidate_sha256": sha256(candidate_path),
+            "primary_sha256": primary_hash,
+            "candidate_sha256": candidate_hash,
+            "primary_decode_identity": primary_identity,
+            "candidate_decode_identity": candidate_identity,
+            "independent_candidates": independent,
             "primary_words": len(primary_words),
             "candidate_words": len(candidate_words),
             "edit_distance": distance,
             "disagreement_ratio": round(disagreement, 5),
             "regions": region_rows,
             "requires_lyric_review": not (primary_instrumental and candidate_instrumental),
-            "failure": None if content_valid else "empty_transcripts_without_instrumental_classification",
-            "pass": regional_pass,
+            "failure": (
+                "empty_transcripts_without_instrumental_classification" if not content_valid
+                else "candidates_not_independent" if not independent
+                else "global_disagreement_exceeds_threshold" if disagreement > args.max_disagreement
+                else None
+            ),
+            "pass": consensus_pass,
         })
     report = {
         "schema": "karaoke-transcript-consensus/v1",

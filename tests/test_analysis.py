@@ -21,3 +21,25 @@ def test_same_pitch_contour_is_split_at_word_boundaries():
     events = contour_to_note_events(contour, words)
     assert {event["word_index"] for event in events} == {0, 1}
     assert all(event["lyric"] in {"hold", "on"} for event in events)
+
+
+def test_brief_vibrato_excursion_does_not_fragment_note_event():
+    contour = [
+        {"time": index * 0.05, "midi": midi, "probability": 0.95}
+        for index, midi in enumerate([60, 60, 60, 61, 61, 60, 60, 60, 60])
+    ]
+    words = [{"word_index": 0, "text": "held", "start": 0.0, "end": 0.5}]
+
+    events = contour_to_note_events(contour, words)
+    assert len(events) == 1
+
+
+def test_sustained_pitch_change_creates_second_note_event():
+    contour = [
+        {"time": index * 0.06, "midi": midi, "probability": 0.95}
+        for index, midi in enumerate([60, 60, 60, 60, 62, 62, 62, 62, 62])
+    ]
+    words = [{"word_index": 0, "text": "melisma", "start": 0.0, "end": 0.6}]
+
+    events = contour_to_note_events(contour, words)
+    assert [event["midi"] for event in events] == [60, 62]

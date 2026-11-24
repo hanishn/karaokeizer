@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 def main() -> int:
+    """Classify empty candidates before they may bypass lyric requirements."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--transcripts", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)

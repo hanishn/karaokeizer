@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.metadata
 import json
 import re
@@ -11,7 +12,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 
+def sha256(path: Path) -> str:
+    """Hash a remediation input so stale ledgers cannot authorize changes."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def normalize_stats(transcript: dict) -> None:
+    """Recompute transcript summaries after an accepted regional merge."""
     words = [word for segment in transcript["segments"] for word in segment.get("words", [])]
     transcript["text"] = " ".join(segment["text"] for segment in transcript["segments"])
     transcript["word_count"] = len(words)
@@ -23,6 +35,7 @@ def normalize_stats(transcript: dict) -> None:
 
 
 def replacement_segments(result: dict, offset: float) -> list[dict]:
+    """Normalize and shift region-local Whisper output to album time."""
     replacement = []
     for segment in result["segments"]:
         words = [
@@ -120,6 +133,7 @@ def validate_merged_timeline(segments: list[dict]) -> list[str]:
 
 
 def main() -> int:
+    """Repair only hash-authorized regions into a quarantined candidate."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--album-manifest", required=True, type=Path)
     parser.add_argument("--stem-root", required=True, type=Path)
@@ -134,6 +148,11 @@ def main() -> int:
     import whisper
     album = json.loads(args.album_manifest.read_text(encoding="utf-8"))
     ledger = json.loads(args.qa_ledger.read_text(encoding="utf-8"))
+    if ledger.get("schema") != "karaoke-album-qa/v1":
+        parser.error("QA ledger schema is not karaoke-album-qa/v1")
+    if ledger.get("album_manifest_sha256") != sha256(args.album_manifest):
+        parser.error("QA ledger is stale for the supplied album manifest")
+    ledger_hash = sha256(args.qa_ledger)
     tracks = {int(track["number"]): track for track in album["tracks"]}
     stem_root = args.stem_root.resolve(strict=True)
     skip = {int(value) for value in args.skip_tracks.split(",") if value.strip()}
@@ -156,11 +175,20 @@ def main() -> int:
         if track_number in skip or not regions:
             continue
         track = tracks[track_number]
+        source_transcript = args.transcripts / f"{track_number:02d} - {track['title']}.whisper.json"
         destination = args.output_dir / f"{track_number:02d} - {track['title']}.whisper.json"
         transcript = json.loads(destination.read_text(encoding="utf-8"))
         vocal_path = (stem_root / track["vocal_stem"]).resolve(strict=True)
         if not vocal_path.is_relative_to(stem_root):
             raise ValueError(f"vocal stem escapes --stem-root: {track['vocal_stem']}")
+        evidence = row.get("evidence", {})
+        if (
+            not source_transcript.exists()
+            or sha256(source_transcript) != evidence.get("transcript_sha256")
+            or sha256(vocal_path) != evidence.get("vocal_sha256")
+            or evidence.get("vocal_sha256") != track.get("vocal_sha256")
+        ):
+            raise ValueError(f"stale QA remediation evidence for track {track_number}")
         audio = whisper.load_audio(str(vocal_path))
         sample_rate = whisper.audio.SAMPLE_RATE
         region_records = []
@@ -209,13 +237,17 @@ def main() -> int:
         }
         transcript.setdefault("qa_remediation", []).append({
             "created_utc": datetime.now(UTC).isoformat(), "source_ledger": str(args.qa_ledger),
+            "source_ledger_sha256": ledger_hash,
+            "source_transcript_sha256": evidence["transcript_sha256"],
+            "vocal_sha256": evidence["vocal_sha256"],
             "model": args.model, "condition_on_previous_text": False, "regions": region_records,
         })
         destination.write_text(json.dumps(transcript, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         completed.append({"track": track_number, "title": track["title"], "regions": len(regions)})
     summary = {
         "schema": "karaoke-region-remediation/v1", "created_utc": datetime.now(UTC).isoformat(),
-        "model": args.model, "source_ledger": str(args.qa_ledger), "skip_tracks": sorted(skip), "completed": completed,
+        "model": args.model, "source_ledger": str(args.qa_ledger), "source_ledger_sha256": ledger_hash,
+        "album_manifest_sha256": sha256(args.album_manifest), "skip_tracks": sorted(skip), "completed": completed,
     }
     (args.output_dir / "remediation-summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2))

@@ -31,3 +31,20 @@ def test_separation_checkpoint_rejects_changed_source(tmp_path, monkeypatch):
     track.write_bytes(b"changed")
     with pytest.raises(RuntimeError, match="stale or unverifiable"):
         pipeline.separate(config, "python")
+
+
+def test_package_recipe_changes_when_stem_changes(tmp_path):
+    stem, cover = tmp_path / "no_vocals.wav", tmp_path / "cover.jpg"
+    stem.write_bytes(b"first stem")
+    cover.write_bytes(b"cover")
+    config = {
+        "artist": "Human Artist", "album": "Album", "album_suffix": " (Instrumental)",
+        "year": "2026", "genre": "Synthwave",
+    }
+    row = {"number": 1, "title": "Song"}
+    first = pipeline.package_recipe(config, row, stem, cover, "ffmpeg fixture")
+    stem.write_bytes(b"regenerated stem")
+    second = pipeline.package_recipe(config, row, stem, cover, "ffmpeg fixture")
+
+    assert first != second
+    assert first["accompaniment_sha256"] != second["accompaniment_sha256"]

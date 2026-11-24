@@ -7,6 +7,9 @@
     "1": {
       "status": "pass",
       "track_type": "vocal",
+      "source_sha256": "replace-with-64-character-sha256",
+      "vocal_sha256": "replace-with-64-character-sha256",
+      "accompaniment_sha256": "replace-with-64-character-sha256",
       "notes": "No intelligible lead vocal detected in accompaniment; source and vocal stem cross-checked."
     }
   }

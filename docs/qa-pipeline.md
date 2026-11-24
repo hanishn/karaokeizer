@@ -113,10 +113,10 @@ Album promotion requires every track to be promoted or explicitly classified as 
 karaokeizer-transcribe --album-manifest <manifest> --stem-root <work-root> --output-dir <candidate-dir> --model large-v3 --backend openai --beam-size 8 --force
 karaokeizer-audit-transcripts <candidate-dir> --output <candidate-dir>/timing-audit.json --strict
 karaokeizer-compare-transcripts --primary <canonical-dir> --candidate <candidate-dir> --output <qa-dir>/transcript-consensus.json
-karaokeizer-build-player --album-manifest <manifest> --transcripts <promoted-transcripts> --stem-root <work-root> --media-root <packaged-audio-root> --canonical-dir <canonical-root> --analysis-overrides <reviewed-analysis-overrides> --output-dir <fresh-rendered-candidate>
+karaokeizer-build-player --album-manifest <manifest> --transcripts <promoted-transcripts> --stem-root <work-root> --media-root <packaged-audio-root> --ssli-root <local-ssli-distribution> --analysis-overrides <reviewed-analysis-overrides> --output-dir <fresh-rendered-candidate>
 karaokeizer-audit-album --album-manifest <manifest> --source-root <source-root> --stem-root <work-root> --transcripts <promoted-transcripts> --karaoke-data <fresh-rendered-candidate>/karaoke/data --separation-review <separation-review.json> --output <qa-dir>/album-qa-ledger.json
 karaokeizer-audit-player --url <served-player-url> --player <fresh-rendered-candidate>/<player.html> --output <qa-dir>/player-visual-audit.json --evidence-dir <qa-dir>/visual-evidence
-karaokeizer-promote --candidate-dir <fresh-rendered-candidate> --canonical-dir <canonical-root> --transcripts <promoted-transcripts> --album-ledger <qa-dir>/album-qa-ledger.json --visual-ledger <qa-dir>/player-visual-audit.json --consensus-ledger <qa-dir>/transcript-consensus.json --lyric-review <qa-dir>/lyric-review.json --receipt <qa-dir>/promotion-receipt.json
+karaokeizer-promote --candidate-dir <fresh-rendered-candidate> --canonical-dir <canonical-root> --transcripts <promoted-transcripts> --album-ledger <qa-dir>/album-qa-ledger.json --visual-ledger <qa-dir>/player-visual-audit.json --consensus-ledger <qa-dir>/transcript-consensus.json --lyric-review <qa-dir>/lyric-review.json --analysis-review <analysis-overrides.json> --receipt <qa-dir>/promotion-receipt.json
 ```
 
 The command sequence is deliberately album-agnostic; paths and manifest content define the album.

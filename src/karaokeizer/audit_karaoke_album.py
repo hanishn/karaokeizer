@@ -90,6 +90,13 @@ def sonic_metrics(source: Path, vocal: Path, accompaniment: Path, separation_rev
             failures.append("degenerate_or_silent_vocal_stem")
         if not separation_review or separation_review.get("status") != "pass":
             failures.append("vocal_leakage_not_independently_verified")
+        expected_hashes = {
+            "source_sha256": sha256(source),
+            "vocal_sha256": sha256(vocal),
+            "accompaniment_sha256": sha256(accompaniment),
+        }
+        if not separation_review or any(separation_review.get(key) != value for key, value in expected_hashes.items()):
+            failures.append("separation_review_hash_mismatch")
         return {
             "sample_rates": sample_rates,
             "channels": channels,
@@ -103,6 +110,7 @@ def sonic_metrics(source: Path, vocal: Path, accompaniment: Path, separation_rev
             "accompaniment_rms_db_relative_source": db_ratio(accompaniment_rms, source_rms),
             "vocal_accompaniment_correlation": round(correlation, 5),
             "separation_review": separation_review,
+            "reviewed_audio_hashes": expected_hashes,
             "failures": failures,
             "pass": not failures,
         }
@@ -274,6 +282,11 @@ def main() -> int:
         accompaniment_path = (stem_root / track["accompaniment_stem"]).resolve(strict=True)
         if not source_path.is_relative_to(source_root) or not vocal_path.is_relative_to(stem_root) or not accompaniment_path.is_relative_to(stem_root):
             raise ValueError(f"track path escapes a trusted root: {track['title']}")
+        if (
+            transcript.get("vocal_sha256") != track["vocal_sha256"]
+            or int(transcript.get("track", -1)) != int(track["number"])
+        ):
+            raise ValueError(f"transcript provenance mismatch for track {track['number']}")
         review = separation_reviews.get(str(track["number"]))
         if review and (
             review.get("track_type") not in {"vocal", "instrumental"}

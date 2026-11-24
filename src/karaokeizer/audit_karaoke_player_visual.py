@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import re
+import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -24,6 +25,16 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def served_player_sha256(url: str) -> str:
+    """Hash the exact response body the browser will exercise."""
+
+    request = urllib.request.Request(url, headers={"Accept-Encoding": "identity"})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        if response.status != 200:
+            raise ValueError(f"player URL returned HTTP {response.status}")
+        return hashlib.sha256(response.read()).hexdigest()
+
+
 def main() -> int:
     """Exercise representative player times in Chromium and retain evidence."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -37,6 +48,10 @@ def main() -> int:
         help="Add a known-risk sample (repeatable), for example --sample 5:166",
     )
     args = parser.parse_args()
+    player_hash = sha256(args.player)
+    served_hash = served_player_sha256(args.url)
+    if served_hash != player_hash:
+        raise ValueError("served player bytes do not match --player; refusing stale visual audit")
     extra_samples: dict[int, list[float]] = {}
     for value in args.sample:
         track, seconds = value.split(":", 1)
@@ -47,8 +62,17 @@ def main() -> int:
         browser = playwright.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1440, "height": 900})
         page_errors: list[str] = []
+        request_failures: list[str] = []
         page.on("pageerror", lambda error: page_errors.append(str(error)))
-        page.goto(args.url, wait_until="networkidle")
+        page.on("requestfailed", lambda request: request_failures.append(f"{request.method} {request.url}"))
+        page.on(
+            "response",
+            lambda response: request_failures.append(f"HTTP {response.status} {response.url}")
+            if response.status >= 400 else None,
+        )
+        navigation = page.goto(args.url, wait_until="networkidle")
+        if not navigation or not navigation.ok:
+            raise ValueError("player navigation did not return a successful response")
         inventory = page.evaluate("tracks.map((t,index)=>({index,title:t.title,segments:t.segments.map(s=>({start:s.start,end:s.end}))}))")
         for track in inventory:
             segments = track["segments"]
@@ -61,6 +85,11 @@ def main() -> int:
             samples = []
             for sample_index, time in enumerate(sample_times, 1):
                 page.locator("#list button").nth(track["index"]).evaluate("button=>button.click()")
+                try:
+                    page.wait_for_function("audio.readyState >= 1", timeout=10_000)
+                    media_ready = True
+                except Exception:
+                    media_ready = False
                 result = page.evaluate(
                     """time => {
                         audio.currentTime=time; render();
@@ -82,6 +111,7 @@ def main() -> int:
                     }""",
                     time,
                 )
+                result["mediaReady"] = media_ready
                 screenshot = args.evidence_dir / f"{track['index'] + 1:02d}-{safe_name(track['title'])}-{sample_index}.png"
                 page.locator("#staff").screenshot(path=str(screenshot))
                 result["screenshot"] = str(screenshot)
@@ -95,6 +125,8 @@ def main() -> int:
                 failures.append("visible_lyric_without_note_binding")
             if any(sample["clippedWords"] for sample in samples):
                 failures.append("lyric_clipped_at_notation_edge")
+            if any(not sample["mediaReady"] for sample in samples):
+                failures.append("audio_metadata_not_loaded")
             rows.append({"track": track["index"] + 1, "title": track["title"], "samples": samples, "failures": failures, "pass": not failures})
         browser.close()
     report = {
@@ -102,12 +134,14 @@ def main() -> int:
         "created_utc": datetime.now(UTC).isoformat(),
         "url": args.url,
         "player": str(args.player),
-        "player_sha256": sha256(args.player),
+        "player_sha256": player_hash,
+        "served_player_sha256": served_hash,
         "tracks": rows,
         "page_errors": page_errors,
+        "request_failures": request_failures,
         "passing_tracks": sum(row["pass"] for row in rows),
         "track_count": len(rows),
-        "pass": not page_errors and all(row["pass"] for row in rows),
+        "pass": not page_errors and not request_failures and all(row["pass"] for row in rows),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

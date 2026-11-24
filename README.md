@@ -29,6 +29,8 @@ purchased audio
 ```
 
 See [the QA and promotion model](docs/qa-pipeline.md) for the full lifecycle.
+For a complete release run, recovery rules, and review responsibilities, use
+the [operator guide](docs/operator-guide.md).
 
 ## Requirements
 
@@ -93,7 +95,7 @@ karaokeizer-build-player `
   --transcripts C:\path\to\work\transcripts\promoted `
   --stem-root C:\path\to\work `
   --media-root C:\path\to\output `
-  --canonical-dir C:\path\to\published `
+  --ssli-root C:\path\to\ssli-distribution `
   --analysis-overrides C:\path\to\analysis-overrides.json `
   --output-dir C:\path\to\work\rendered-candidate-001
 

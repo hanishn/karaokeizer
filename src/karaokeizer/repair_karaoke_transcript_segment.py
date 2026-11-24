@@ -17,6 +17,7 @@ from .remediate_karaoke_regions import (
 
 
 def main() -> int:
+    """Repair one region into a new candidate after structural validation."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--transcript", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path, help="Fresh candidate path; input is never overwritten")

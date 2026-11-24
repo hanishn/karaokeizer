@@ -1,5 +1,7 @@
 {
   "schema": "karaokeizer-analysis-overrides/v1",
+  "pass": true,
+  "method": "listening_review_with_trusted_score_or_metadata",
   "reviewer": "replace-with-reviewer-name",
   "reviewed_utc": "2026-01-01T00:00:00Z",
   "tracks": {

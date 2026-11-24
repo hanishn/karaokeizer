@@ -28,6 +28,7 @@ from .html_safety import json_for_script
 from .paths import safe_component
 
 SCHEMA = "instrumental-album-pipeline/v1"
+PACKAGE_RECIPE_VERSION = "flac-s32-level12-attached-cover/v1"
 
 
 def command(args: list[str], *, capture: bool = True) -> subprocess.CompletedProcess[str]:
@@ -129,6 +130,26 @@ def source_tracks(config: dict) -> list[dict]:
 def stem_dir(config: dict, source: Path) -> Path:
     """Return the deterministic Demucs output directory for a source track."""
     return Path(config["work_dir"]) / config["demucs_model"] / source.stem
+
+
+def package_recipe(config: dict, row: dict, stem: Path, cover: Path, ffmpeg_version: str) -> dict:
+    """Describe every material input and setting used to encode one FLAC."""
+
+    return {
+        "schema": "karaokeizer-package-checkpoint/v1",
+        "recipe_version": PACKAGE_RECIPE_VERSION,
+        "ffmpeg_version": ffmpeg_version,
+        "accompaniment_sha256": sha256(stem),
+        "cover_sha256": sha256(cover),
+        "metadata": {
+            "artist": config["artist"],
+            "album": f"{config['album']}{config['album_suffix']}",
+            "title": f"{row['title']} (Instrumental)",
+            "track": row["number"],
+            "year": config["year"],
+            "genre": config["genre"],
+        },
+    }
 
 
 def separation_recipe(config: dict, source: Path) -> dict:
@@ -236,6 +257,7 @@ def package(config: dict, ffmpeg: str, ffprobe: str, *, force: bool) -> Path:
     shutil.copy2(cover, output / "cover.jpg")
     tracks = source_tracks(config)
     work_root = Path(config["work_dir"]).resolve()
+    ffmpeg_version = tool_version(ffmpeg)
     manifest_tracks = []
     for row in tracks:
         stem = stem_dir(config, row["source"]) / "no_vocals.wav"
@@ -244,6 +266,14 @@ def package(config: dict, ffmpeg: str, ffprobe: str, *, force: bool) -> Path:
             raise FileNotFoundError(f"Missing stem pair for {row['source'].name}")
         filename = output_filename(row)
         destination = output / filename
+        checkpoint_path = destination.with_suffix(destination.suffix + ".karaokeizer.json")
+        recipe = package_recipe(config, row, stem, cover, ffmpeg_version)
+        if destination.exists() and not force:
+            if not checkpoint_path.exists():
+                raise RuntimeError(f"existing package lacks provenance checkpoint: {destination}")
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            if checkpoint.get("recipe") != recipe or checkpoint.get("output_sha256") != sha256(destination):
+                raise RuntimeError(f"stale packaged output; rerun package with --force: {destination}")
         if force or not destination.exists():
             command(
                 [
@@ -284,6 +314,10 @@ def package(config: dict, ffmpeg: str, ffprobe: str, *, force: bool) -> Path:
                     str(destination),
                 ]
             )
+            checkpoint_path.write_text(
+                json.dumps({"recipe": recipe, "output_sha256": sha256(destination)}, indent=2) + "\n",
+                encoding="utf-8",
+            )
         source_audio = audio_probe(row["source"], ffprobe)
         output_audio = audio_probe(destination, ffprobe)
         manifest_tracks.append(
@@ -300,6 +334,9 @@ def package(config: dict, ffmpeg: str, ffprobe: str, *, force: bool) -> Path:
                 "output_file": filename,
                 "output_sha256": sha256(destination),
                 "output_audio": output_audio,
+                "package_recipe": recipe,
+                "package_checkpoint": checkpoint_path.name,
+                "package_checkpoint_sha256": sha256(checkpoint_path),
             }
         )
     playlist_name = f"{config['album']} - Instrumental.m3u8"
@@ -313,7 +350,7 @@ def package(config: dict, ffmpeg: str, ffprobe: str, *, force: bool) -> Path:
         "tools": {
             "python": sys.version.splitlines()[0],
             "demucs": importlib.metadata.version("demucs"),
-            "ffmpeg": tool_version(ffmpeg),
+            "ffmpeg": ffmpeg_version,
             "ffprobe": tool_version(ffprobe),
         },
         "separation": {"model": config["demucs_model"], "mode": "two-stems=vocals", "float32": True},
@@ -348,6 +385,17 @@ def verify(config: dict, ffprobe: str) -> dict:
             continue
         if sha256(destination) != row["output_sha256"]:
             failures.append(f"output hash changed: {row['output_file']}")
+        checkpoint_path = output / row["package_checkpoint"]
+        if not checkpoint_path.exists():
+            failures.append(f"package checkpoint missing: {row['output_file']}")
+        else:
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            if sha256(checkpoint_path) != row["package_checkpoint_sha256"]:
+                failures.append(f"package checkpoint changed: {row['output_file']}")
+            if checkpoint.get("recipe") != row["package_recipe"]:
+                failures.append(f"package recipe mismatch: {row['output_file']}")
+            if checkpoint.get("output_sha256") != row["output_sha256"]:
+                failures.append(f"package checkpoint output mismatch: {row['output_file']}")
         actual = audio_probe(destination, ffprobe)
         source_audio = row["source_audio"]
         if abs(actual["duration_seconds"] - source_audio["duration_seconds"]) > 0.1:

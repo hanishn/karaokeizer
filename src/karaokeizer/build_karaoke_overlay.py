@@ -7,8 +7,8 @@ import hashlib
 import html
 import json
 import math
-import os
 import re
+import shutil
 import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
@@ -220,6 +220,7 @@ def contour_to_note_events(contour: list[dict], words: list[dict]) -> list[dict]
         word_start, word_end = float(lyric_word["start"]), float(lyric_word["end"])
         points = [point for point in contour if word_start - 0.04 <= float(point["time"]) <= word_end + 0.06]
         current: list[dict] = []
+        pending_change: list[dict] = []
 
         def flush_word_event(
             word_start: float = word_start,
@@ -243,18 +244,31 @@ def contour_to_note_events(contour: list[dict], words: list[dict]) -> list[dict]
             current = []
 
         for point in points:
-            rounded = int(round(point["midi"]))
             if current:
                 previous_time = float(current[-1]["time"])
-                center = int(round(float(np.median([p["midi"] for p in current[-5:]]))))
-                if float(point["time"]) - previous_time > 0.18 or abs(rounded - center) >= 1:
+                if float(point["time"]) - previous_time > 0.18:
+                    current.extend(pending_change)
+                    pending_change = []
                     flush_word_event()
+                else:
+                    center = float(np.median([p["midi"] for p in current[-7:]]))
+                    if abs(float(point["midi"]) - center) >= 0.75:
+                        pending_change.append(point)
+                        stable_for = float(pending_change[-1]["time"]) - float(pending_change[0]["time"])
+                        if len(pending_change) >= 3 and stable_for >= 0.12:
+                            flush_word_event()
+                            current = pending_change
+                            pending_change = []
+                        continue
+                    current.extend(pending_change)
+                    pending_change = []
             current.append(point)
+        current.extend(pending_change)
         flush_word_event()
     return events
 
 
-def analysis_cache_key(track: dict, transcript_hash: str) -> dict:
+def analysis_cache_key(track: dict, transcript_hash: str, analysis_review_hash: str | None = None) -> dict:
     """Describe every input and algorithm version that can affect analysis."""
 
     return {
@@ -264,6 +278,7 @@ def analysis_cache_key(track: dict, transcript_hash: str) -> dict:
         "pitch_method": PITCH_METHOD,
         "key_method": KEY_METHOD,
         "rhythm_method": RHYTHM_METHOD,
+        "analysis_review_sha256": analysis_review_hash,
     }
 
 
@@ -420,7 +435,7 @@ def main() -> int:
     )
     parser.add_argument("--media-root", required=True, type=Path, help="Trusted packaged-album directory containing audio")
     parser.add_argument("--stem-root", required=True, type=Path, help="Trusted root for manifest-relative stem paths")
-    parser.add_argument("--canonical-dir", required=True, type=Path, help="Intended final player directory used for relative media URLs")
+    parser.add_argument("--ssli-root", required=True, type=Path, help="Local SSLI distribution containing index.html")
     parser.add_argument("--analysis-cache-dir", type=Path, help="Optional read-only cache; reused only on exact cache-key match")
     parser.add_argument("--analysis-overrides", type=Path, help="Reviewed per-track key and meter overrides")
     args = parser.parse_args()
@@ -431,10 +446,23 @@ def main() -> int:
     output.mkdir(parents=True, exist_ok=True)
     media_root = args.media_root.resolve(strict=True)
     stem_root = args.stem_root.resolve(strict=True)
-    canonical_root = args.canonical_dir.resolve()
-    overrides = json.loads(args.analysis_overrides.read_text(encoding="utf-8")).get("tracks", {}) if args.analysis_overrides else {}
+    ssli_root = args.ssli_root.resolve(strict=True)
+    if not (ssli_root / "index.html").is_file():
+        parser.error("--ssli-root must contain index.html")
+    override_payload = json.loads(args.analysis_overrides.read_text(encoding="utf-8")) if args.analysis_overrides else None
+    if override_payload and (
+        override_payload.get("schema") != "karaokeizer-analysis-overrides/v1"
+        or override_payload.get("pass") is not True
+        or not override_payload.get("reviewer")
+        or not override_payload.get("method")
+        or not override_payload.get("reviewed_utc")
+    ):
+        parser.error("analysis overrides require schema, pass=true, reviewer, method, and reviewed_utc")
+    overrides = override_payload.get("tracks", {}) if override_payload else {}
+    override_hash = sha256(args.analysis_overrides) if args.analysis_overrides else None
     data_dir = output / "karaoke" / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(ssli_root, output / "karaoke" / "ssli", dirs_exist_ok=False)
     failures = []
     player_tracks = []
     for track in album["tracks"]:
@@ -444,6 +472,12 @@ def main() -> int:
             failures.append(f"missing transcript: {track['title']}")
             continue
         transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
+        if (
+            transcript.get("vocal_sha256") != track["vocal_sha256"]
+            or int(transcript.get("track", -1)) != int(track["number"])
+        ):
+            failures.append(f"transcript provenance mismatch: {track['title']}")
+            continue
         # Never synthesize timing from a repeated chorus during a production
         # build. Invalid segments are counted and routed back to remediation.
         clean_transcript_segments = [
@@ -465,7 +499,7 @@ def main() -> int:
         if sha256(vocal_path) != track["vocal_sha256"] or sha256(accompaniment_path) != track["accompaniment_sha256"]:
             failures.append(f"stem hash mismatch: {track['title']}")
             continue
-        cache_key = analysis_cache_key(track, transcript_hash)
+        cache_key = analysis_cache_key(track, transcript_hash, override_hash)
         cache_path = args.analysis_cache_dir / f"{track['number']:02d}.karaoke.json" if args.analysis_cache_dir else None
         existing = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path and cache_path.exists() else None
         cache_valid = bool(existing and existing.get("analysis_cache_key") == cache_key)
@@ -501,11 +535,17 @@ def main() -> int:
         if not packaged_audio.is_relative_to(media_root) or sha256(packaged_audio) != track["output_sha256"]:
             failures.append(f"packaged audio hash mismatch: {track['title']}")
             continue
+        candidate_audio = output / "media" / safe_component(track["output_file"], field="packaged audio filename")
+        candidate_audio.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(packaged_audio, candidate_audio)
+        if sha256(candidate_audio) != track["output_sha256"]:
+            failures.append(f"candidate audio copy mismatch: {track['title']}")
+            continue
         data = {
             "schema": SCHEMA,
             "track": track["number"],
             "title": track["title"],
-            "audio": Path(os.path.relpath(packaged_audio, canonical_root)).as_posix(),
+            "audio": candidate_audio.relative_to(output).as_posix(),
             "audio_sha256": track["output_sha256"],
             "vocal_sha256": track["vocal_sha256"],
             "transcript_sha256": transcript_hash,
@@ -530,7 +570,12 @@ def main() -> int:
         data_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         player_tracks.append(data)
     html = build_html(output, album, player_tracks) if len(player_tracks) == len(album["tracks"]) else None
-    artifact_paths = ([html] if html else []) + sorted(data_dir.glob("*.karaoke.json"))
+    artifact_paths = (
+        ([html] if html else [])
+        + sorted(data_dir.glob("*.karaoke.json"))
+        + sorted((output / "media").glob("*"))
+        + sorted(path for path in (output / "karaoke" / "ssli").rglob("*") if path.is_file())
+    )
     report = {
         "schema": SCHEMA,
         "verified_utc": datetime.now(UTC).isoformat(),
@@ -538,6 +583,7 @@ def main() -> int:
         "tracks_built": len(player_tracks),
         "player": html.name if html else None,
         "album_manifest_sha256": sha256(args.album_manifest),
+        "analysis_review_sha256": override_hash,
         "artifacts": [
             {"path": path.relative_to(output).as_posix(), "sha256": sha256(path)} for path in artifact_paths
         ],

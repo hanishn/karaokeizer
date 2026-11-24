@@ -46,7 +46,8 @@ class RangeRequestHandler(SimpleHTTPRequestHandler):
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data:; media-src 'self'; frame-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'",
+            "img-src 'self' data:; media-src 'self'; frame-src 'self'; connect-src 'none'; object-src 'none'; "
+            "base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
         )
         super().end_headers()
 
@@ -113,6 +114,7 @@ class RangeRequestHandler(SimpleHTTPRequestHandler):
 
 
 def main() -> None:
+    """Serve one player tree on loopback with range and security headers."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--bind", default="127.0.0.1")

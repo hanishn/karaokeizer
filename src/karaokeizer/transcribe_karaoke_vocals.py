@@ -16,6 +16,7 @@ SCHEMA = "karaoke-whisper-transcript/v1"
 
 
 def sha256(path: Path) -> str:
+    """Hash vocal stems for candidate identity and safe checkpoint reuse."""
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -24,11 +25,13 @@ def sha256(path: Path) -> str:
 
 
 def main() -> int:
+    """Transcribe manifest-bound stems into an immutable candidate directory."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--album-manifest", required=True, type=Path)
     parser.add_argument("--stem-root", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--model", default="large-v3")
+    parser.add_argument("--model-revision", help="Required immutable Hugging Face revision for faster-whisper")
     parser.add_argument("--backend", choices=["openai", "faster-whisper"], default="openai")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--compute-type", default="int8")
@@ -52,10 +55,24 @@ def main() -> int:
     tracks = tracks[: args.limit or None]
     package_name = "faster-whisper" if args.backend == "faster-whisper" else "openai-whisper"
     package_version = importlib.metadata.version(package_name)
+    if args.backend == "faster-whisper":
+        if not args.model_revision:
+            parser.error("--model-revision is required with faster-whisper")
+        model_revision = args.model_revision
+        model_source = args.model
+    else:
+        import whisper
+
+        model_source = whisper._MODELS.get(args.model)  # noqa: SLF001 - upstream checksum-bearing registry
+        if not model_source:
+            parser.error("OpenAI Whisper model must be a checksum-pinned built-in model name")
+        model_revision = model_source.rstrip("/").split("/")[-2]
     decode_identity = {
         "backend": args.backend,
         "package_version": package_version,
         "model": args.model,
+        "model_revision": model_revision,
+        "model_source": model_source,
         "device": args.device,
         "compute_type": args.compute_type,
         "beam_size": args.beam_size,
@@ -67,10 +84,10 @@ def main() -> int:
     if args.backend == "faster-whisper":
         from faster_whisper import WhisperModel
 
-        model = WhisperModel(args.model, device=args.device, compute_type=args.compute_type)
+        model = WhisperModel(
+            args.model, device=args.device, compute_type=args.compute_type, revision=args.model_revision,
+        )
     else:
-        import whisper
-
         model = whisper.load_model(args.model, device=args.device)
     index = []
 
