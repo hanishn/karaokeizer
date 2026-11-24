@@ -1,11 +1,12 @@
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from karaokeizer.prepare_ssli import CAPABILITY_FILE, CAPABILITY_SCHEMA, PINNED_SSLI_COMMIT
+from karaokeizer.prepare_ssli import CAPABILITY_FILE, CAPABILITY_SCHEMA, PINNED_SSLI_COMMIT, operator_error
 from karaokeizer.ssli_manifest import MANIFEST_NAME, build_manifest, sha256, validate_manifest
 
 COMPATIBLE_INDEX = "<script>formant.scheduleNote = formant.cancelSchedule = function () {}</script>"
@@ -92,3 +93,14 @@ def test_manifest_rejects_distribution_without_capability_declaration(tmp_path: 
 
     with pytest.raises(ValueError, match="karaokeizer-ssli-capabilities"):
         build_manifest(tmp_path)
+
+
+def test_prepare_ssli_failure_preserves_bounded_diagnostics_and_remediation():
+    error = subprocess.CalledProcessError(1, ["git", "apply"], stderr="specific patch failure")
+
+    message = operator_error(error)
+
+    assert "git apply" in message
+    assert "specific patch failure" in message
+    assert "pristine pinned checkout" in message
+    assert "new empty output directory" in message

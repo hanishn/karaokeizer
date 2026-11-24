@@ -1,5 +1,5 @@
 diff --git a/shared/assets/formant-engine.js b/shared/assets/formant-engine.js
-index 4bd7339..35cb8b8 100644
+index 4bd7339..ac12d85 100644
 --- a/shared/assets/formant-engine.js
 +++ b/shared/assets/formant-engine.js
 @@ -171,6 +171,8 @@
@@ -35,16 +35,20 @@ index 4bd7339..35cb8b8 100644
        }
      };
    }
-@@ -992,6 +996,66 @@
+@@ -992,6 +996,84 @@
      }
    }
  
-+  function scheduleNote(midi, velocity, instId, startTime, endTime, scheduleId) {
++  function scheduleNotes(notes, instId, scheduleId) {
 +    if (!isWorkletReady || !formantWorkletNodes[instId]) {
 +      throw new Error('Timestamped formant scheduling requires the AudioWorklet engine');
 +    }
-+    if (!Number.isFinite(startTime) || !Number.isFinite(endTime) || endTime <= startTime) {
-+      throw new Error('Invalid formant schedule times');
++    if (!Array.isArray(notes) || notes.length < 1 || notes.length > 10000) {
++      throw new Error('Formant schedule must contain 1 to 10000 notes');
++    }
++    scheduleId = String(scheduleId);
++    if (!scheduleId || scheduleId.length > 128) {
++      throw new Error('Invalid formant schedule identifier');
 +    }
 +    connectToOutput(instId);
 +    var settings = getOrCreateSettings(instId);
@@ -70,19 +74,33 @@ index 4bd7339..35cb8b8 100644
 +      humAdsr: (typeof rawHum === 'number') ? rawHum : (rawHum.adsr || 0),
 +      humTiming: 0
 +    };
-+    var eventId = String(scheduleId) + ':' + (nextScheduleEventId++);
-+    formantWorkletNodes[instId].port.postMessage({
-+      type: 'scheduleNote',
-+      scheduleId: String(scheduleId),
-+      eventId: eventId,
-+      midiNote: midi,
-+      velocity: velocity || 100,
-+      noteFreq: midiToFreq(midi),
-+      startFrame: Math.round(startTime * audioContext.sampleRate),
-+      endFrame: Math.round(endTime * audioContext.sampleRate),
-+      settings: voiceSettings
++    var now = audioContext.currentTime;
++    var events = notes.map(function(note) {
++      if (!Number.isFinite(note.startTime) || !Number.isFinite(note.endTime) ||
++          note.endTime <= note.startTime || note.startTime < now - 1 || note.endTime > now + 7200 ||
++          !Number.isInteger(note.midi) || note.midi < 0 || note.midi > 127 ||
++          !Number.isFinite(note.velocity) || note.velocity < 1 || note.velocity > 127) {
++        throw new Error('Invalid timestamped formant note');
++      }
++      return {
++        scheduleId: scheduleId,
++        eventId: scheduleId + ':' + (nextScheduleEventId++),
++        midiNote: note.midi,
++        velocity: note.velocity,
++        noteFreq: midiToFreq(note.midi),
++        startFrame: Math.round(note.startTime * audioContext.sampleRate),
++        endFrame: Math.round(note.endTime * audioContext.sampleRate),
++        settings: voiceSettings
++      };
 +    });
-+    return eventId;
++    formantWorkletNodes[instId].port.postMessage({
++      type: 'scheduleNotes', events: events
++    });
++    return events.map(function(event) { return event.eventId; });
++  }
++
++  function scheduleNote(midi, velocity, instId, startTime, endTime, scheduleId) {
++    return scheduleNotes([{ midi: midi, velocity: velocity, startTime: startTime, endTime: endTime }], instId, scheduleId)[0];
 +  }
 +
 +  function cancelSchedule(scheduleId, instId) {
@@ -102,11 +120,12 @@ index 4bd7339..35cb8b8 100644
    // ============================================================
    // Parameter Control
    // ============================================================
-@@ -1135,6 +1199,10 @@
+@@ -1135,6 +1217,11 @@
      noteOn: noteOn,
      noteOff: noteOff,
      allNotesOff: allNotesOff,
 +    scheduleNote: scheduleNote,
++    scheduleNotes: scheduleNotes,
 +    cancelSchedule: cancelSchedule,
 +    getScheduleTelemetry: getScheduleTelemetry,
 +    formantSchedulingApi: 1,
@@ -114,7 +133,7 @@ index 4bd7339..35cb8b8 100644
      // Parameter control
      setVowel: setVowel,
 diff --git a/shared/assets/worklets/formant-worklet.js b/shared/assets/worklets/formant-worklet.js
-index 95992e3..f20b037 100644
+index 95992e3..33727db 100644
 --- a/shared/assets/worklets/formant-worklet.js
 +++ b/shared/assets/worklets/formant-worklet.js
 @@ -416,6 +416,7 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
@@ -125,12 +144,16 @@ index 95992e3..f20b037 100644
  
      this.port.onmessage = this.handleMessage.bind(this);
      this.port.postMessage({ type: 'ready' });
-@@ -437,6 +438,14 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
+@@ -437,6 +438,18 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
          this.onAllNotesOff();
          break;
  
 +      case 'scheduleNote':
 +        this.onScheduleNote(data);
++        break;
++
++      case 'scheduleNotes':
++        this.onScheduleNotes(data.events);
 +        break;
 +
 +      case 'cancelSchedule':
@@ -140,7 +163,7 @@ index 95992e3..f20b037 100644
        case 'updateSettings':
          this.onUpdateSettings(data);
          break;
-@@ -466,6 +475,10 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
+@@ -466,6 +479,10 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
        voice = this.voices[0]; // steal oldest
      }
      voice.noteOn(data.midiNote, data.velocity, data.noteFreq, data.settings);
@@ -151,21 +174,45 @@ index 95992e3..f20b037 100644
    }
  
    onNoteOff(midi) {
-@@ -485,6 +498,53 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
+@@ -485,6 +502,77 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
      }
    }
  
 +  onScheduleNote(data) {
-+    if (!Number.isFinite(data.startFrame) || !Number.isFinite(data.endFrame) || data.endFrame <= data.startFrame) {
++    this.onScheduleNotes([data]);
++  }
++
++  onScheduleNotes(events) {
++    if (!Array.isArray(events) || events.length < 1 || events.length > 10000 ||
++        this.scheduledEvents.length + events.length * 2 > 20000) {
++      this.port.postMessage({ type: 'scheduleTelemetry', state: 'rejected', reason: 'schedule_capacity' });
 +      return;
 +    }
-+    this.scheduledEvents.push({ frame: data.startFrame, order: 1, action: 'start', data: data });
-+    this.scheduledEvents.push({ frame: data.endFrame, order: 0, action: 'release', data: data });
++    var additions = [];
++    for (var i = 0; i < events.length; i++) {
++      var data = events[i];
++      var valid = Number.isFinite(data.startFrame) && Number.isFinite(data.endFrame) &&
++        data.endFrame > data.startFrame && data.startFrame >= currentFrame - sampleRate &&
++        data.endFrame <= currentFrame + sampleRate * 7200 && Number.isInteger(data.midiNote) &&
++        data.midiNote >= 0 && data.midiNote <= 127 && Number.isFinite(data.velocity) &&
++        data.velocity >= 1 && data.velocity <= 127 && typeof data.scheduleId === 'string' &&
++        data.scheduleId.length > 0 && data.scheduleId.length <= 128 &&
++        typeof data.eventId === 'string' && data.eventId.length <= 192;
++      if (!valid) {
++        this.port.postMessage({ type: 'scheduleTelemetry', state: 'rejected', reason: 'invalid_event' });
++        return;
++      }
++      additions.push({ frame: data.startFrame, order: 1, action: 'start', data: data });
++      additions.push({ frame: data.endFrame, order: 0, action: 'release', data: data });
++    }
++    this.scheduledEvents = this.scheduledEvents.concat(additions);
 +    this.scheduledEvents.sort(function(a, b) { return a.frame - b.frame || a.order - b.order; });
-+    this.port.postMessage({
-+      type: 'scheduleTelemetry', state: 'scheduled', scheduleId: data.scheduleId,
-+      eventId: data.eventId, startFrame: data.startFrame, endFrame: data.endFrame
-+    });
++    for (var j = 0; j < events.length; j++) {
++      this.port.postMessage({
++        type: 'scheduleTelemetry', state: 'scheduled', scheduleId: events[j].scheduleId,
++        eventId: events[j].eventId, startFrame: events[j].startFrame, endFrame: events[j].endFrame
++      });
++    }
 +  }
 +
 +  onCancelSchedule(scheduleId) {
@@ -205,7 +252,7 @@ index 95992e3..f20b037 100644
    onUpdateSettings(data) {
      if (data.vowel !== undefined) { this.vowel = data.vowel; }
      if (data.vowelTarget !== undefined) { this.vowelTarget = data.vowelTarget; }
-@@ -561,10 +621,26 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
+@@ -561,10 +649,26 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
      var PER_VOICE_BASE_GAIN = 0.75;
  
      for (var s = 0; s < blockSize; s++) {
@@ -233,6 +280,3 @@ index 95992e3..f20b037 100644
          }
        }
        // Soft clip via Pade [3,2] approximant of tanh:
-warning: in the working copy of 'shared/assets/formant-engine.js', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'shared/assets/worklets/formant-worklet.js', LF will be replaced by CRLF the next time Git touches it
-

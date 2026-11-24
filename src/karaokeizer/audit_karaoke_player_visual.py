@@ -111,7 +111,11 @@ def main() -> int:
             "enabled": page.locator("#guide-toggle").get_attribute("aria-pressed") == "true",
             "status": page.locator("#guide-status").inner_text(),
         }
-        inventory = page.evaluate("tracks.map((t,index)=>({index,title:t.title,noteCount:t.note_events.length,segments:t.segments.map(s=>({start:s.start,end:s.end}))}))")
+        inventory = page.evaluate(
+            "tracks.map((t,index)=>({index,title:t.title,noteCount:t.note_events.length,"
+            "noteEvents:t.note_events.map(n=>({start:n.start,end:n.end})),"
+            "segments:t.segments.map(s=>({start:s.start,end:s.end}))}))"
+        )
         for track in inventory:
             segments = track["segments"]
             if not segments:
@@ -198,12 +202,53 @@ def main() -> int:
             "frame => frame.contentWindow.SynthLab.formant.getScheduleTelemetry?.() || []"
         )
         worklet_states = {event.get("state") for event in worklet_telemetry}
+        worklet_rejections = [event for event in worklet_telemetry if event.get("state") == "rejected"]
         timing_events = [event for event in worklet_telemetry if event.get("state") in {"started", "released"}]
         timing_within_quantum = all(
             abs(event.get("actualFrame", 0) - event.get("requestedFrame", 0)) <= 128 for event in timing_events
         )
         audible_releases = [event for event in worklet_telemetry if event.get("state") == "released" and event.get("peak", 0) > 1e-6]
         expected_guide_notes = sum(track["noteCount"] for track in inventory)
+        track_guide_passes = []
+        for row, track in zip(rows, inventory, strict=True):
+            prefix = f"karaoke-{track['index']}-"
+            events = [event for event in worklet_telemetry if str(event.get("scheduleId", "")).startswith(prefix)]
+            first_time = row["samples"][0]["time"] if row["samples"] else 0.0
+            expected = sum(note["end"] > first_time for note in track["noteEvents"])
+            scheduled = [event for event in events if event.get("state") == "scheduled"]
+            started = [event for event in events if event.get("state") == "started"]
+            released = [event for event in events if event.get("state") == "released"]
+            rejected = [event for event in events if event.get("state") == "rejected"]
+            audible = [event for event in released if event.get("peak", 0) > 1e-6]
+            should_sound = any(
+                note["end"] > first_time and note["start"] < first_time + (args.main_thread_stall_ms + 500) / 1_000
+                for note in track["noteEvents"]
+            )
+            batch_counts: dict[str, int] = {}
+            for event in scheduled:
+                schedule_id = str(event.get("scheduleId", ""))
+                batch_counts[schedule_id] = batch_counts.get(schedule_id, 0) + 1
+            track_pass = (
+                (expected == 0 or expected in batch_counts.values())
+                and not rejected
+                and len(audible) == len(released)
+                and (not should_sound or bool(started))
+                and (not should_sound or bool(released))
+            )
+            row["guideEvidence"] = {
+                "expectedScheduled": expected,
+                "scheduled": len(scheduled),
+                "scheduleBatches": batch_counts,
+                "started": len(started),
+                "released": len(released),
+                "audibleReleased": len(audible),
+                "rejected": len(rejected),
+                "pass": track_pass,
+            }
+            if not track_pass:
+                row["failures"].append("guide_voice_track_evidence_failed")
+                row["pass"] = False
+            track_guide_passes.append(track_pass)
         guide_state["telemetry"] = guide_telemetry
         guide_state["workletTelemetry"] = worklet_telemetry
         guide_state["pass"] = (
@@ -215,6 +260,8 @@ def main() -> int:
             and (expected_guide_notes == 0 or bool(timing_events))
             and timing_within_quantum
             and (expected_guide_notes == 0 or bool(audible_releases))
+            and not worklet_rejections
+            and all(track_guide_passes)
         )
         browser.close()
     report = {

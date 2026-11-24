@@ -11,11 +11,13 @@ the distribution's exact allowlist with `karaokeizer-manifest-ssli`.
 The embedded distribution must expose these functions on `SynthLab.formant`:
 
 ```javascript
-scheduleNote(midi, velocity, instrumentId, startTime, endTime, scheduleId)
+scheduleNotes(notes, instrumentId, scheduleId)
 cancelSchedule(scheduleId, instrumentId)
 ```
 
-`startTime` and `endTime` are absolute seconds on SSLI's `AudioContext` clock.
+Each note contains `midi`, `velocity`, `startTime`, and `endTime`; times are
+absolute seconds on SSLI's `AudioContext` clock. A batch is bounded to 10,000
+notes and two hours, validated on both threads, and sorted only once.
 The implementation must enqueue the events in SSLI's formant AudioWorklet and
 render them with the selected formant instrument. It must not translate them
 into main-thread `setTimeout` calls or a generic oscillator substitute.

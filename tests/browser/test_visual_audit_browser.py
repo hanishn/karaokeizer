@@ -52,10 +52,10 @@ def test_visual_audit_exercises_the_hash_bound_served_player(tmp_path: Path, mon
             getCurrentInstrument:()=>0,getInstruments:()=>[slot],timeToSlider:v=>v,
             setFormantSettings:()=>{},stopAllSustained:()=>{},clearExpression:()=>{}},
           presets:{getFormantPresets:()=>[{name:'Alto Choir'}],applyFormantPreset:()=>{}},
-          formant:{init:async()=>{},scheduleNote:(m,v,i,s,e,id)=>{events.push(
-            {type:'scheduleTelemetry',state:'scheduled',scheduleId:id,startFrame:s*48000,endFrame:e*48000},
-            {type:'scheduleTelemetry',state:'started',scheduleId:id,requestedFrame:s*48000,actualFrame:s*48000},
-            {type:'scheduleTelemetry',state:'released',scheduleId:id,requestedFrame:e*48000,actualFrame:e*48000,peak:.1});},
+          formant:{init:async()=>{},scheduleNotes:(notes,i,id)=>notes.forEach(n=>events.push(
+            {type:'scheduleTelemetry',state:'scheduled',scheduleId:id,startFrame:n.startTime*48000,endFrame:n.endTime*48000},
+            {type:'scheduleTelemetry',state:'started',scheduleId:id,requestedFrame:n.startTime*48000,actualFrame:n.startTime*48000},
+            {type:'scheduleTelemetry',state:'released',scheduleId:id,requestedFrame:n.endTime*48000,actualFrame:n.endTime*48000,peak:.1})),
             cancelSchedule:id=>events.push({type:'scheduleTelemetry',state:'cancelled',scheduleId:id}),
             allNotesOff:()=>{},getScheduleTelemetry:()=>events}
         };
@@ -101,6 +101,12 @@ def test_visual_audit_exercises_the_hash_bound_served_player(tmp_path: Path, mon
     assert report["guide_voice"]["telemetry"]["scheduled"] > 0
     assert report["guide_voice"]["telemetry"]["cancelled"] > 0
     assert any(event.get("peak", 0) > 0 for event in report["guide_voice"]["workletTelemetry"])
+    guide_evidence = report["tracks"][0]["guideEvidence"]
+    assert guide_evidence["expectedScheduled"] == 1
+    assert set(guide_evidence["scheduleBatches"].values()) == {1}
+    assert guide_evidence["started"] == guide_evidence["released"] == guide_evidence["audibleReleased"]
+    assert guide_evidence["rejected"] == 0
+    assert guide_evidence["pass"] is True
     assert report["player_sha256"] == report["served_player_sha256"]
     assert list(evidence.glob("*.png"))
 
@@ -123,6 +129,10 @@ def test_real_ssli_formant_worklet_is_audible_and_sample_scheduled(tmp_path: Pat
         "note_events": [
             {"start": 0.1, "end": 0.35, "midi": 60, "note": "C4", "word_index": 0},
             {"start": 2.0, "end": 2.3, "midi": 64, "note": "E4", "word_index": None},
+        ] + [
+            {"start": 10.0 + index * 0.05, "end": 10.04 + index * 0.05,
+             "midi": 60 + index % 12, "note": "dense", "word_index": None}
+            for index in range(1_000)
         ],
         "detected_key": {"status": "confident", "label": "C major", "display": "C major", "confidence": 1.0,
                          "runner_up": {}, "tonic": "C", "mode": "major"},
@@ -158,3 +168,8 @@ def test_real_ssli_formant_worklet_is_audible_and_sample_scheduled(tmp_path: Pat
     assert sum(event["state"] == "started" for event in guide["workletTelemetry"]) == 2
     assert sum(event["state"] == "released" for event in guide["workletTelemetry"]) == 2
     assert max(event.get("peak", 0) for event in guide["workletTelemetry"]) > 1e-6
+    track_evidence = json.loads(output.read_text(encoding="utf-8"))["tracks"][0]["guideEvidence"]
+    assert track_evidence["expectedScheduled"] == 1_002
+    assert 1_002 in track_evidence["scheduleBatches"].values()
+    assert track_evidence["audibleReleased"] == 2
+    assert track_evidence["pass"] is True

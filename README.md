@@ -173,8 +173,10 @@ Read [SECURITY.md](SECURITY.md). Keep purchased media, generated stems, transcri
 
 ## License
 
-Karaokeizer is licensed under the [Apache License 2.0](LICENSE). SSLI, media,
-models, and other third-party inputs are not bundled; their own licenses and
+Karaokeizer is licensed under the [Apache License 2.0](LICENSE). This repository
+includes an Apache-2.0 modification patch for the pinned SSLI formant engine and
+AudioWorklet; its attribution is preserved in [NOTICE](NOTICE). The full SSLI
+distribution, media, and models are not bundled, and their own licenses and
 redistribution terms continue to apply.
 
 ## Contributing

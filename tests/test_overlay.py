@@ -56,7 +56,7 @@ def test_hum_uses_ssli_formant_scheduling_not_local_oscillators(tmp_path):
     }
 
     player = build_html(tmp_path, album, [track]).read_text(encoding="utf-8")
-    assert "SL.formant.scheduleNote" in player
+    assert "SL.formant.scheduleNotes" in player
     assert "SL?.formant?.cancelSchedule" in player
     assert "timestamped formant scheduling API missing" in player
     assert "createOscillator" not in player

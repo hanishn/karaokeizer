@@ -22,6 +22,20 @@ def run(command: list[str], cwd: Path, *, check: bool = True) -> subprocess.Comp
     return subprocess.run(command, cwd=cwd, check=check, text=True, capture_output=True)
 
 
+def operator_error(error: Exception) -> str:
+    """Render bounded build diagnostics with an actionable recovery step."""
+
+    remediation = "Use a pristine pinned checkout and a new empty output directory."
+    if isinstance(error, subprocess.CalledProcessError):
+        command = " ".join(str(part) for part in error.cmd)
+        detail = (error.stderr or error.stdout or "").strip()
+        if len(detail) > 2_000:
+            detail = "..." + detail[-2_000:]
+        suffix = f"\n{detail}" if detail else ""
+        return f"SSLI preparation command failed: {command}{suffix}\n{remediation}"
+    return f"{error}\n{remediation}"
+
+
 def sha256(path: Path) -> str:
     """Hash a file without loading it all into memory."""
 
@@ -86,7 +100,7 @@ def main() -> int:
     try:
         destination = prepare(args.source, args.output)
     except (ValueError, OSError, subprocess.SubprocessError) as error:
-        parser.error(str(error))
+        parser.error(operator_error(error))
     print(destination)
     return 0
 
