@@ -17,6 +17,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+class SecureStaticHandler(http.server.SimpleHTTPRequestHandler):
+    """Static fixture server with the same critical CSP as Karaokeizer."""
+
+    def end_headers(self) -> None:
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; connect-src 'none'; "
+            "frame-ancestors 'none'; media-src 'self'",
+        )
+        super().end_headers()
+
+
 def test_visual_audit_exercises_the_hash_bound_served_player(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Run the real Chromium audit against a minimal contract-compatible player."""
 
@@ -46,7 +58,7 @@ def test_visual_audit_exercises_the_hash_bound_served_player(tmp_path: Path, mon
         </script></body></html>""",
         encoding="utf-8",
     )
-    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(tmp_path))
+    handler = functools.partial(SecureStaticHandler, directory=str(tmp_path))
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

@@ -141,6 +141,15 @@ def package_recipe(config: dict, row: dict, stem: Path, cover: Path, ffmpeg_vers
         "ffmpeg_version": ffmpeg_version,
         "accompaniment_sha256": sha256(stem),
         "cover_sha256": sha256(cover),
+        "encoding": {
+            "audio_codec": "flac",
+            "compression_level": 12,
+            "sample_format": "s32",
+            "audio_map": "0:a:0",
+            "cover_map": "1:v:0",
+            "cover_codec": "copy",
+            "cover_disposition": "attached_pic",
+        },
         "metadata": {
             "artist": config["artist"],
             "album": f"{config['album']}{config['album_suffix']}",

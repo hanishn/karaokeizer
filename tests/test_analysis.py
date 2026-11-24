@@ -1,4 +1,6 @@
-from karaokeizer.build_karaoke_overlay import analysis_cache_key, contour_to_note_events
+import pytest
+
+from karaokeizer.build_karaoke_overlay import analysis_cache_key, contour_to_note_events, validate_analysis_overrides
 
 
 def test_analysis_cache_key_changes_with_every_material_input():
@@ -43,3 +45,31 @@ def test_sustained_pitch_change_creates_second_note_event():
 
     events = contour_to_note_events(contour, words)
     assert [event["midi"] for event in events] == [60, 62]
+
+
+def valid_review() -> dict:
+    return {
+        "schema": "karaokeizer-analysis-overrides/v1", "pass": True,
+        "reviewer": "Reviewer", "method": "listening and score", "reviewed_utc": "2026-01-01T00:00:00Z",
+        "tracks": {
+            "1": {
+                "status": "pass",
+                "key": {"tonic": "C", "mode": "major", "evidence": "Checked against score."},
+                "meter": {"numerator": 4, "denominator": 4, "downbeat_phase": 0, "evidence": "Checked measures."},
+            }
+        },
+    }
+
+
+def test_analysis_review_requires_exact_track_inventory():
+    review = valid_review()
+    review["tracks"] = {}
+    with pytest.raises(ValueError, match="exactly match"):
+        validate_analysis_overrides(review, [{"number": 1}])
+
+
+def test_analysis_review_requires_per_track_evidence():
+    review = valid_review()
+    review["tracks"]["1"]["key"]["evidence"] = ""
+    with pytest.raises(ValueError, match="incomplete"):
+        validate_analysis_overrides(review, [{"number": 1}])

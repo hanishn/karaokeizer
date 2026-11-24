@@ -87,6 +87,25 @@ def promote_tree(canonical: Path, artifacts: list[tuple[Path, str]]) -> tuple[li
         raise
 
 
+def write_receipt_or_rollback(path: Path, receipt: dict, canonical: Path, backup: Path | None) -> None:
+    """Publish the receipt atomically, restoring canonical if publication fails."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        temporary.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    except Exception:
+        if temporary.exists():
+            temporary.unlink()
+        failed = canonical.parent / f".{canonical.name}.failed-{uuid.uuid4().hex}"
+        if canonical.exists():
+            os.replace(canonical, failed)
+        if backup and backup.exists():
+            os.replace(backup, canonical)
+        raise
+
+
 def main() -> int:
     """Validate all evidence bindings and atomically promote the candidate."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -109,7 +128,10 @@ def main() -> int:
     visual = load_passing(args.visual_ledger, "visual", "karaoke-player-visual-audit/v1")
     consensus = load_passing(args.consensus_ledger, "consensus", "karaoke-transcript-consensus/v1")
     lyric_review = load_passing(args.lyric_review, "lyric review", "karaokeizer-lyric-review/v1")
-    load_passing(args.analysis_review, "analysis review", "karaokeizer-analysis-overrides/v1")
+    analysis_review = load_passing(args.analysis_review, "analysis review", "karaokeizer-analysis-overrides/v1")
+    for label, review in (("lyric", lyric_review), ("analysis", analysis_review)):
+        if not review.get("reviewer") or not review.get("method") or not review.get("reviewed_utc"):
+            raise ValueError(f"{label} review lacks reviewer, method, or reviewed_utc")
     if verification.get("analysis_review_sha256") != sha256(args.analysis_review):
         raise ValueError("analysis review is not bound to the rendered candidate")
     artifacts = candidate_artifacts(candidate, verification)
@@ -122,6 +144,12 @@ def main() -> int:
         raise ValueError("album ledger and rendered candidate use different manifests")
     if visual.get("track_count") != expected_count or visual.get("passing_tracks") != expected_count:
         raise ValueError("visual ledger track inventory is incomplete")
+    expected_numbers = {int(row["track"]) for row in album["tracks"]}
+    if len(expected_numbers) != expected_count:
+        raise ValueError("album ledger contains duplicate track identifiers")
+    visual_rows = {int(row["track"]): row for row in visual.get("tracks", [])}
+    if set(visual_rows) != expected_numbers or any(row.get("pass") is not True for row in visual_rows.values()):
+        raise ValueError("visual ledger contains a missing or failing track row")
     expected_data = {f"karaoke/data/{int(row['track']):02d}.karaoke.json" for row in album["tracks"]}
     actual_data = {item[1] for item in artifacts if item[1].startswith("karaoke/data/")}
     if actual_data != expected_data:
@@ -141,6 +169,8 @@ def main() -> int:
         raise ValueError("consensus or lyric-review inventory is incomplete")
     for row in album["tracks"]:
         number = int(row["track"])
+        if row.get("pass") is not True or not row.get("gates") or not all(row["gates"].values()):
+            raise ValueError(f"album ledger contains a failing track row: {number}")
         data_relative = f"karaoke/data/{number:02d}.karaoke.json"
         data_path = candidate / data_relative
         if sha256(data_path) != row["evidence"]["karaoke_data_sha256"]:
@@ -153,10 +183,19 @@ def main() -> int:
         if transcript_hash != row["evidence"]["transcript_sha256"]:
             raise ValueError(f"album ledger transcript mismatch for track {number}")
         consensus_row = consensus_by_file.get(transcript_path.name)
-        if not consensus_row or consensus_row.get("candidate_sha256") != transcript_hash:
+        if (
+            not consensus_row
+            or consensus_row.get("candidate_sha256") != transcript_hash
+            or consensus_row.get("pass") is not True
+            or consensus_row.get("independent_candidates") is not True
+        ):
             raise ValueError(f"consensus ledger mismatch for track {number}")
         review = reviews.get(str(number), {})
-        if review.get("status") != "pass" or review.get("transcript_sha256") != transcript_hash:
+        if (
+            review.get("status") != "pass"
+            or review.get("transcript_sha256") != transcript_hash
+            or not review.get("notes")
+        ):
             raise ValueError(f"lyric review missing or stale for track {number}")
 
     promoted, backup = promote_tree(canonical, artifacts)
@@ -174,8 +213,7 @@ def main() -> int:
         "artifacts": promoted,
         "previous_canonical_backup": str(backup) if backup else None,
     }
-    args.receipt.parent.mkdir(parents=True, exist_ok=True)
-    args.receipt.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+    write_receipt_or_rollback(args.receipt, receipt, canonical, backup)
     print(json.dumps(receipt, indent=2))
     return 0
 

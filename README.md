@@ -49,7 +49,8 @@ cd karaokeizer
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -e ".[all,dev]"
+python -m pip install --require-hashes -r requirements-production-windows-py312.lock
+python -m pip install --no-deps --no-build-isolation .
 playwright install chromium
 ```
 
@@ -58,7 +59,11 @@ On macOS or Linux, replace the activation command with
 (for example, `brew install ffmpeg` or `sudo apt install ffmpeg`). The remaining
 commands and manifest formats are platform-independent.
 
-For a smaller installation, select only the stages you need, such as `.[separation]`, `.[transcription]`, or `.[visual-qa]`.
+The production lock targets Windows and Python 3.12, the primary supported
+processing environment. Development and CI use `requirements-dev.lock` on
+Windows and Linux. Other production platforms can select only the stages they
+need (`.[separation]`, `.[transcription]`, or `.[visual-qa]`), but that
+live-resolved path is not yet claimed as bit-for-bit reproducible.
 
 ## First album
 
@@ -88,6 +93,14 @@ karaokeizer-audit-transcripts C:\path\to\work\transcripts\candidate-001 `
 ```
 
 5. Resolve failures according to [the QA pipeline](docs/qa-pipeline.md), then build and serve the player:
+
+First create the safety allowlist for the reviewed SSLI browser distribution.
+The command rejects symlinks/junctions, hidden files, unexpected types, and
+oversized trees; rerun it whenever the distribution intentionally changes.
+
+```powershell
+karaokeizer-manifest-ssli C:\path\to\ssli-distribution
+```
 
 ```powershell
 karaokeizer-build-player `

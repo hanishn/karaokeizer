@@ -38,6 +38,14 @@ def edit_distance(left: list[str], right: list[str]) -> int:
     return previous[-1]
 
 
+def independence_signature(identity: dict | None) -> tuple | None:
+    """Return model-level fields that constitute an independent evidence run."""
+
+    if not identity:
+        return None
+    return identity.get("backend"), identity.get("model"), identity.get("model_revision")
+
+
 def main() -> int:
     """Compare independent transcript runs globally and in repaired regions."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -66,7 +74,7 @@ def main() -> int:
             primary_hash != candidate_hash
             and bool(primary_identity)
             and bool(candidate_identity)
-            and primary_identity != candidate_identity
+            and independence_signature(primary_identity) != independence_signature(candidate_identity)
         )
         remediations = candidate_data.get("qa_remediation", [])
         regions = remediations[-1].get("regions", []) if remediations else []

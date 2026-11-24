@@ -58,3 +58,17 @@ def test_identical_run_identity_is_not_independent(tmp_path: Path, monkeypatch: 
     assert invoke(monkeypatch, primary, candidate, tmp_path / "report.json") == 1
     row = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))["tracks"][0]
     assert row["failure"] == "candidates_not_independent"
+
+
+def test_device_only_difference_is_not_independent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    primary, candidate = tmp_path / "primary", tmp_path / "candidate"
+    write_transcript(
+        primary / "01 - Song.whisper.json", ["matching", "words"],
+        {"backend": "openai", "model": "large-v3", "model_revision": "abc", "device": "cpu"},
+    )
+    write_transcript(
+        candidate / "01 - Song.whisper.json", ["matching", "words"],
+        {"backend": "openai", "model": "large-v3", "model_revision": "abc", "device": "cuda"},
+    )
+
+    assert invoke(monkeypatch, primary, candidate, tmp_path / "report.json") == 1

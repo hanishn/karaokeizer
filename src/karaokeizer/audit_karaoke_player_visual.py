@@ -9,6 +9,7 @@ import re
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from playwright.sync_api import sync_playwright
 
@@ -63,7 +64,15 @@ def main() -> int:
         page = browser.new_page(viewport={"width": 1440, "height": 900})
         page_errors: list[str] = []
         request_failures: list[str] = []
+        external_requests: list[str] = []
+        expected_origin = f"{urlsplit(args.url).scheme}://{urlsplit(args.url).netloc}"
         page.on("pageerror", lambda error: page_errors.append(str(error)))
+        page.on(
+            "request",
+            lambda request: external_requests.append(request.url)
+            if request.url.startswith(("http://", "https://")) and not request.url.startswith(expected_origin + "/")
+            else None,
+        )
         page.on("requestfailed", lambda request: request_failures.append(f"{request.method} {request.url}"))
         page.on(
             "response",
@@ -73,6 +82,9 @@ def main() -> int:
         navigation = page.goto(args.url, wait_until="networkidle")
         if not navigation or not navigation.ok:
             raise ValueError("player navigation did not return a successful response")
+        csp = navigation.headers.get("content-security-policy", "")
+        if "frame-ancestors 'none'" not in csp or "connect-src 'none'" not in csp:
+            raise ValueError("player response lacks the required restrictive Content-Security-Policy")
         inventory = page.evaluate("tracks.map((t,index)=>({index,title:t.title,segments:t.segments.map(s=>({start:s.start,end:s.end}))}))")
         for track in inventory:
             segments = track["segments"]
@@ -112,6 +124,19 @@ def main() -> int:
                     time,
                 )
                 result["mediaReady"] = media_ready
+                if sample_index == 1 and media_ready:
+                    result["playbackAdvanced"] = page.evaluate(
+                        """async () => {
+                            const before=audio.currentTime;
+                            try { await audio.play(); } catch { return false; }
+                            await new Promise(resolve=>setTimeout(resolve,500));
+                            const advanced=audio.currentTime>before+0.05;
+                            audio.pause();
+                            return advanced;
+                        }"""
+                    )
+                else:
+                    result["playbackAdvanced"] = True
                 screenshot = args.evidence_dir / f"{track['index'] + 1:02d}-{safe_name(track['title'])}-{sample_index}.png"
                 page.locator("#staff").screenshot(path=str(screenshot))
                 result["screenshot"] = str(screenshot)
@@ -127,6 +152,8 @@ def main() -> int:
                 failures.append("lyric_clipped_at_notation_edge")
             if any(not sample["mediaReady"] for sample in samples):
                 failures.append("audio_metadata_not_loaded")
+            if any(not sample["playbackAdvanced"] for sample in samples):
+                failures.append("audio_playback_clock_did_not_advance")
             rows.append({"track": track["index"] + 1, "title": track["title"], "samples": samples, "failures": failures, "pass": not failures})
         browser.close()
     report = {
@@ -139,9 +166,10 @@ def main() -> int:
         "tracks": rows,
         "page_errors": page_errors,
         "request_failures": request_failures,
+        "external_requests": external_requests,
         "passing_tracks": sum(row["pass"] for row in rows),
         "track_count": len(rows),
-        "pass": not page_errors and not request_failures and all(row["pass"] for row in rows),
+        "pass": not page_errors and not request_failures and not external_requests and all(row["pass"] for row in rows),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

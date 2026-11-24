@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from karaokeizer import promote
-from karaokeizer.promote import main, promote_tree, sha256
+from karaokeizer.promote import main, promote_tree, sha256, write_receipt_or_rollback
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -31,7 +31,13 @@ def promotion_fixture(tmp_path: Path) -> dict[str, Path]:
         path.write_text(content, encoding="utf-8")
     audio.parent.mkdir(parents=True, exist_ok=True)
     audio.write_bytes(b"synthetic-audio-fixture")
-    write_json(analysis, {"schema": "karaokeizer-analysis-overrides/v1", "pass": True})
+    write_json(
+        analysis,
+        {
+            "schema": "karaokeizer-analysis-overrides/v1", "pass": True,
+            "reviewer": "Reviewer", "method": "score and listening", "reviewed_utc": "2026-01-01T00:00:00Z",
+        },
+    )
 
     verification = candidate / "karaoke-verification.json"
     write_json(
@@ -65,6 +71,8 @@ def promotion_fixture(tmp_path: Path) -> dict[str, Path]:
             "tracks": [
                 {
                     "track": 1,
+                    "pass": True,
+                    "gates": {"sonic": True, "lyrics": True, "alignment": True, "pitch": True},
                     "evidence": {
                         "karaoke_data_sha256": sha256(data),
                         "transcript_sha256": sha256(transcript),
@@ -78,6 +86,7 @@ def promotion_fixture(tmp_path: Path) -> dict[str, Path]:
         {
             "schema": "karaoke-player-visual-audit/v1", "pass": True,
             "track_count": 1, "passing_tracks": 1, "player_sha256": sha256(player),
+            "tracks": [{"track": 1, "pass": True}],
         },
     )
     write_json(
@@ -85,7 +94,10 @@ def promotion_fixture(tmp_path: Path) -> dict[str, Path]:
         {
             "schema": "karaoke-transcript-consensus/v1",
             "pass": True,
-            "tracks": [{"file": transcript.name, "candidate_sha256": sha256(transcript)}],
+            "tracks": [{
+                "file": transcript.name, "candidate_sha256": sha256(transcript),
+                "pass": True, "independent_candidates": True,
+            }],
         },
     )
     write_json(
@@ -93,7 +105,10 @@ def promotion_fixture(tmp_path: Path) -> dict[str, Path]:
         {
             "schema": "karaokeizer-lyric-review/v1",
             "pass": True,
-            "tracks": {"1": {"status": "pass", "transcript_sha256": sha256(transcript)}},
+            "reviewer": "Reviewer", "method": "listening", "reviewed_utc": "2026-01-01T00:00:00Z",
+            "tracks": {"1": {
+                "status": "pass", "transcript_sha256": sha256(transcript), "notes": "Reviewed every word.",
+            }},
         },
     )
     return {
@@ -213,3 +228,31 @@ def test_promotion_rejects_unexpected_ledger_schema(tmp_path: Path, monkeypatch:
 
     with pytest.raises(ValueError, match="unexpected schema"):
         invoke(monkeypatch, fixture)
+
+
+def test_promotion_rejects_inconsistent_consensus_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    fixture = promotion_fixture(tmp_path)
+    consensus = json.loads(fixture["consensus"].read_text(encoding="utf-8"))
+    consensus["tracks"][0]["independent_candidates"] = False
+    write_json(fixture["consensus"], consensus)
+
+    with pytest.raises(ValueError, match="consensus ledger mismatch"):
+        invoke(monkeypatch, fixture)
+
+
+def test_receipt_failure_restores_previous_canonical(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    canonical, backup = tmp_path / "canonical", tmp_path / "canonical.backup"
+    canonical.mkdir()
+    backup.mkdir()
+    (canonical / "new").write_text("new", encoding="utf-8")
+    (backup / "old").write_text("old", encoding="utf-8")
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("synthetic receipt failure")
+
+    monkeypatch.setattr(Path, "write_text", fail_write)
+    with pytest.raises(OSError, match="synthetic"):
+        write_receipt_or_rollback(tmp_path / "receipt.json", {"pass": True}, canonical, backup)
+
+    assert (canonical / "old").read_text(encoding="utf-8") == "old"
+    assert not backup.exists()

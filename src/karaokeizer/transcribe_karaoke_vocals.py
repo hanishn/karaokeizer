@@ -56,8 +56,8 @@ def main() -> int:
     package_name = "faster-whisper" if args.backend == "faster-whisper" else "openai-whisper"
     package_version = importlib.metadata.version(package_name)
     if args.backend == "faster-whisper":
-        if not args.model_revision:
-            parser.error("--model-revision is required with faster-whisper")
+        if not args.model_revision or not re.fullmatch(r"[0-9a-f]{40}", args.model_revision):
+            parser.error("--model-revision must be a full 40-character lowercase Hugging Face commit SHA")
         model_revision = args.model_revision
         model_source = args.model
     else:

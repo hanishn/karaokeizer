@@ -19,6 +19,7 @@ import pyphen
 
 from .html_safety import json_for_script
 from .paths import safe_component
+from .ssli_manifest import MANIFEST_NAME, validate_manifest
 
 SCHEMA = "karaoke-overlay/v1"
 KEY_METHOD = "cqt_chroma_ks-v1"
@@ -297,6 +298,37 @@ def apply_key_override(detected: dict, override: dict | None) -> dict:
     }
 
 
+def validate_analysis_overrides(payload: dict, album_tracks: list[dict]) -> dict:
+    """Require a named, complete key/meter review for every album track."""
+
+    if (
+        payload.get("schema") != "karaokeizer-analysis-overrides/v1"
+        or payload.get("pass") is not True
+        or not payload.get("reviewer")
+        or not payload.get("method")
+        or not payload.get("reviewed_utc")
+    ):
+        raise ValueError("analysis review requires schema, pass=true, reviewer, method, and reviewed_utc")
+    rows = payload.get("tracks", {})
+    expected = {str(int(track["number"])) for track in album_tracks}
+    if set(rows) != expected:
+        raise ValueError("analysis review track inventory must exactly match the album")
+    for number, row in rows.items():
+        key, meter = row.get("key", {}), row.get("meter", {})
+        if (
+            row.get("status") != "pass"
+            or not key.get("evidence")
+            or key.get("tonic") not in NOTE_NAMES
+            or key.get("mode") not in {"major", "minor"}
+            or not meter.get("evidence")
+            or not isinstance(meter.get("numerator"), int)
+            or meter.get("denominator") not in {2, 4, 8, 16}
+            or not isinstance(meter.get("downbeat_phase"), int)
+        ):
+            raise ValueError(f"analysis review is incomplete for track {number}")
+    return rows
+
+
 def segment_timing_errors(segment: dict) -> list[str]:
     """Return singer-visible timing defects; defective segments must never reach the player."""
     errors: list[str] = []
@@ -368,9 +400,9 @@ details{{margin-top:1rem}}summary{{cursor:pointer;font-weight:700;color:#c4b5fd;
 <span id="now-playing">Track: —</span><audio id="audio" controls preload="metadata"></audio><div class="performance-status"><div class="status-card"><small>SONG KEY</small><strong id="key">—</strong></div><div class="status-card"><small>CURRENT NOTE</small><div id="note-line" aria-live="polite">—</div></div></div><div id="lyrics">Select a track</div>
 <div class="view-controls" role="group" aria-label="Playback and timing controls"><div class="degree-legend"><span style="--c:#22c55e">root</span><span style="--c:#22d3ee">2</span><span style="--c:#3b82f6">3</span><span style="--c:#a855f7">4</span><span style="--c:#ec4899">5</span><span style="--c:#f97316">6</span><span style="--c:#facc15">7</span></div><label class="guide-control">Lyrics timing <input id="lyric-bias" type="range" min="-500" max="500" step="10" value="0"><output id="lyric-bias-value" class="guide-value">on time</output></label><button id="guide-toggle" class="guide" type="button" aria-pressed="false">Humming guide: off</button><label class="guide-control">Volume <input id="guide-volume" type="range" min="0" max="500" step="10" value="180"><output id="guide-volume-value" class="guide-value">180%</output></label><label class="guide-control">Hum timing <input id="guide-bias" type="range" min="-500" max="500" step="10" value="0"><output id="guide-bias-value" class="guide-value">on time</output></label><span id="guide-status">SSLI warm alto hum</span><details class="guide-envelope"><summary>Hum envelope (ADSR)</summary><div class="envelope-grid"><label class="guide-control">Attack <input id="adsr-a" type="range" min="1" max="500" value="25"><output id="adsr-a-value" class="guide-value">25 ms</output></label><label class="guide-control">Decay <input id="adsr-d" type="range" min="1" max="500" value="120"><output id="adsr-d-value" class="guide-value">120 ms</output></label><label class="guide-control">Sustain <input id="adsr-s" type="range" min="0" max="100" value="82"><output id="adsr-s-value" class="guide-value">82%</output></label><label class="guide-control">Release <input id="adsr-r" type="range" min="1" max="1000" value="180"><output id="adsr-r-value" class="guide-value">180 ms</output></label></div></details></div>
 <div id="analysis-state" role="status" aria-live="polite">Preparing vocal guide</div><canvas id="staff" width="1000" height="400" style="height:400px" aria-label="Two-measure grand staff with synchronized vocal notes, whole-word lyrics, and proportional rhythm"></canvas><details id="track-picker" open><summary>Choose track</summary><ol id="list"></ol></details><iframe id="ssli-engine" src="karaoke/ssli/index.html?exhibitHost=1" title="SSLI guide voice engine" hidden></iframe>
-<script>const tracks={payload};let current=0,animationFrame=null,guideEnabled=false,guideReady=false,guideInstrument=null,guideTimers=[],guideScheduled=new Set(),guideVolume=1.8,guideBias=0,lyricBias=0,guideAdsr={{a:25,d:120,s:82,r:180}};const audio=document.querySelector('#audio'),lyrics=document.querySelector('#lyrics'),noteLine=document.querySelector('#note-line'),nowPlaying=document.querySelector('#now-playing'),analysisState=document.querySelector('#analysis-state'),staff=document.querySelector('#staff'),sctx=staff.getContext('2d'),list=document.querySelector('#list'),keyline=document.querySelector('#key'),guideToggle=document.querySelector('#guide-toggle'),guideStatus=document.querySelector('#guide-status'),guideVolumeInput=document.querySelector('#guide-volume'),guideVolumeValue=document.querySelector('#guide-volume-value'),guideBiasInput=document.querySelector('#guide-bias'),guideBiasValue=document.querySelector('#guide-bias-value'),lyricBiasInput=document.querySelector('#lyric-bias'),lyricBiasValue=document.querySelector('#lyric-bias-value'),degreeColors=['#22c55e','#22d3ee','#3b82f6','#a855f7','#ec4899','#f97316','#facc15'],letterNames=['C','D','E','F','G','A','B'];
+<script>const tracks={payload};let current=0,animationFrame=null,guideEnabled=false,guideReady=false,guideInstrument=null,guideNodes=[],guideScheduled=new Set(),guideVolume=1.8,guideBias=0,lyricBias=0,guideAdsr={{a:25,d:120,s:82,r:180}};window.karaokeGuideTelemetry={{scheduled:0,cancelled:0}};const audio=document.querySelector('#audio'),lyrics=document.querySelector('#lyrics'),noteLine=document.querySelector('#note-line'),nowPlaying=document.querySelector('#now-playing'),analysisState=document.querySelector('#analysis-state'),staff=document.querySelector('#staff'),sctx=staff.getContext('2d'),list=document.querySelector('#list'),keyline=document.querySelector('#key'),guideToggle=document.querySelector('#guide-toggle'),guideStatus=document.querySelector('#guide-status'),guideVolumeInput=document.querySelector('#guide-volume'),guideVolumeValue=document.querySelector('#guide-volume-value'),guideBiasInput=document.querySelector('#guide-bias'),guideBiasValue=document.querySelector('#guide-bias-value'),lyricBiasInput=document.querySelector('#lyric-bias'),lyricBiasValue=document.querySelector('#lyric-bias-value'),degreeColors=['#22c55e','#22d3ee','#3b82f6','#a855f7','#ec4899','#f97316','#facc15'],letterNames=['C','D','E','F','G','A','B'];
 function escapeHtml(value){{return String(value).replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
-function resetGuide(){{guideTimers.forEach(clearTimeout);guideTimers=[];guideScheduled.clear();const SL=ssliHost();SL?.audio?.stopAllSustained?.();SL?.audio?.clearExpression?.()}}
+function resetGuide(){{guideNodes.forEach(node=>{{try{{node.stop()}}catch{{}}}});window.karaokeGuideTelemetry.cancelled+=guideNodes.length;guideNodes=[];guideScheduled.clear();const SL=ssliHost();SL?.audio?.stopAllSustained?.();SL?.audio?.clearExpression?.()}}
 function load(i,play=true){{resetGuide();current=i;const t=tracks[i],ambiguous=t.detected_key.status==='ambiguous',display=ambiguous?`Likely ${{t.detected_key.label}}`:t.detected_key.label||t.detected_key.display;audio.src=t.audio;nowPlaying.textContent=`Track ${{i+1}} of ${{tracks.length}}: ${{t.title}}`;keyline.textContent=display;keyline.title=`${{ambiguous?'Low confidence; ':''}}confidence ${{t.detected_key.confidence.toFixed(2)}}${{t.detected_key.runner_up?.label?`; alternate ${{t.detected_key.runner_up.label}}`:''}}`;[...list.children].forEach((li,n)=>{{li.classList.toggle('active',n===i);li.querySelector('button').setAttribute('aria-current',n===i?'true':'false')}});render();if(play)audio.play().catch(()=>{{}})}}
 function activeSegment(t,time){{return t.segments.find(s=>time>=s.start&&time<=s.end)||null}}
 function effectiveEnd(w){{return Math.min(w.end,w.start+2.5)}}
@@ -412,7 +444,8 @@ function applyGuideVolume(){{const SL=ssliHost(),id=guideInstrument?.id??guideIn
 function applyGuideAdsr(){{const SL=ssliHost(),id=guideInstrument?.id??guideInstrument,slot=SL?.audio?.getInstruments?.()?.find(x=>x.id===id)||SL?.audio?.getInstruments?.()?.[id];if(!slot?.settings||!SL?.audio?.timeToSlider)return;slot.settings.adsr={{a:SL.audio.timeToSlider(guideAdsr.a,500,500),d:SL.audio.timeToSlider(guideAdsr.d,500,500),s:guideAdsr.s,r:SL.audio.timeToSlider(guideAdsr.r,1000,1000)}}}}
 function timingLabel(ms){{return ms===0?'on time':`${{Math.abs(ms)}} ms ${{ms<0?'early':'late'}}`}}
 async function initGuide(){{const SL=ssliHost();if(!SL){{guideStatus.textContent='SSLI engine is still loading';return false}}try{{const ctx=SL.audio.getCtx?.();if(ctx?.resume)await ctx.resume();SL.audio.initEffectChain?.();if(SL.formant?.init)await SL.formant.init(ctx);const inst=SL.audio.getCurrentInstrument?.()??0,alto=SL.presets.getFormantPresets?.().find(p=>p.name==='Alto Choir');if(!alto||!SL.presets.applyFormantPreset)throw new Error('Alto Choir preset missing');SL.presets.applyFormantPreset(alto,inst);SL.audio.setFormantSettings?.(inst,{{vowel:'O',vowelTarget:'U',morphX:18,breathiness:8,glottalPulseWidth:58,vowelSequenceEnabled:false}});guideInstrument=inst;const slot=SL.audio.getInstruments?.()?.find(x=>x.id===inst)||SL.audio.getInstruments?.()?.[inst];if(slot?.type!=='formant'||!slot.masterOutput)throw new Error('formant output did not initialize');applyGuideVolume();applyGuideAdsr();guideReady=true;guideStatus.textContent='SSLI warm alto hum · ready';return true}}catch(e){{guideStatus.textContent=`SSLI unavailable: ${{e.message||e}}`;return false}}}}
-function scheduleGuide(){{if(!guideEnabled||!guideReady||audio.paused)return;const SL=ssliHost(),id=guideInstrument?.id??guideInstrument;if(!SL||id===null||id===undefined)return;const now=audio.currentTime,horizon=now+1,trackAtSchedule=current,rate=Math.max(.25,audio.playbackRate||1);tracks[current].note_events.filter(w=>{{const biased=w.start+guideBias;return biased>=now-.04&&biased<=horizon}}).forEach(w=>{{const key=`${{current}}:${{w.start}}:${{w.end}}:${{w.midi}}`;if(guideScheduled.has(key))return;guideScheduled.add(key);const biased=w.start+guideBias,delay=Math.max(0,(biased-now)*1000/rate),duration=Math.max(.06,(w.end-w.start)/rate);guideTimers.push(setTimeout(()=>{{if(!guideEnabled||audio.paused||current!==trackAtSchedule)return;if(audio.currentTime>biased+.12)return;SL.audio.playNoteOnInstrument(Math.round(w.midi),duration,id,104,{{realtimePhrase:true,releaseSeconds:guideAdsr.r/1000}})}},delay))}})}}
+function scheduleHumNode(ctx,output,midi,startAt,duration){{const fundamental=440*Math.pow(2,(midi-69)/12),mix=ctx.createGain(),filter=ctx.createBiquadFilter(),envelope=ctx.createGain(),osc1=ctx.createOscillator(),osc2=ctx.createOscillator(),attack=guideAdsr.a/1000,decay=guideAdsr.d/1000,release=guideAdsr.r/1000,sustain=Math.max(.001,guideAdsr.s/100);osc1.type='sine';osc2.type='triangle';osc1.frequency.setValueAtTime(fundamental,startAt);osc2.frequency.setValueAtTime(fundamental*2,startAt);mix.gain.setValueAtTime(.11,startAt);filter.type='lowpass';filter.frequency.setValueAtTime(1400,startAt);filter.Q.setValueAtTime(.7,startAt);envelope.gain.setValueAtTime(.0001,startAt);envelope.gain.linearRampToValueAtTime(.22,startAt+attack);envelope.gain.linearRampToValueAtTime(.22*sustain,startAt+attack+decay);const releaseAt=Math.max(startAt+attack+decay,startAt+duration);envelope.gain.setValueAtTime(.22*sustain,releaseAt);envelope.gain.exponentialRampToValueAtTime(.0001,releaseAt+release);osc1.connect(mix);osc2.connect(mix);mix.connect(filter);filter.connect(envelope);envelope.connect(output);osc1.start(startAt);osc2.start(startAt);osc1.stop(releaseAt+release+.02);osc2.stop(releaseAt+release+.02);guideNodes.push(osc1,osc2);window.karaokeGuideTelemetry.scheduled++}}
+function scheduleGuide(){{if(!guideEnabled||!guideReady||audio.paused)return;const SL=ssliHost(),id=guideInstrument?.id??guideInstrument,ctx=SL?.audio?.getCtx?.(),slot=SL?.audio?.getInstruments?.()?.find(x=>x.id===id)||SL?.audio?.getInstruments?.()?.[id];if(!ctx||!slot?.masterOutput)return;const now=audio.currentTime,horizon=now+2,rate=Math.max(.25,audio.playbackRate||1);tracks[current].note_events.filter(w=>{{const biased=w.start+guideBias;return biased<=horizon&&w.end+guideBias>=now-.04}}).forEach(w=>{{const key=`${{current}}:${{w.start}}:${{w.end}}:${{w.midi}}`;if(guideScheduled.has(key))return;guideScheduled.add(key);const biased=w.start+guideBias,startAt=ctx.currentTime+Math.max(0,biased-now)/rate,remaining=Math.max(.06,(w.end+guideBias-Math.max(now,biased))/rate);scheduleHumNode(ctx,slot.masterOutput,Math.round(w.midi),startAt,remaining)}})}}
 async function toggleGuide(){{guideEnabled=!guideEnabled;if(guideEnabled&&!guideReady)guideEnabled=await initGuide();if(!guideEnabled)resetGuide();guideToggle.classList.toggle('active',guideEnabled);guideToggle.setAttribute('aria-pressed',String(guideEnabled));guideToggle.textContent=`Humming guide: ${{guideEnabled?'on':'off'}}`}}
 function animateNotation(){{render();scheduleGuide();if(!audio.paused&&!audio.ended)animationFrame=requestAnimationFrame(animateNotation)}}
 function startNotation(){{if(animationFrame)cancelAnimationFrame(animationFrame);animationFrame=requestAnimationFrame(animateNotation)}}
@@ -447,22 +480,31 @@ def main() -> int:
     media_root = args.media_root.resolve(strict=True)
     stem_root = args.stem_root.resolve(strict=True)
     ssli_root = args.ssli_root.resolve(strict=True)
-    if not (ssli_root / "index.html").is_file():
-        parser.error("--ssli-root must contain index.html")
+    try:
+        ssli_manifest = validate_manifest(ssli_root)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
     override_payload = json.loads(args.analysis_overrides.read_text(encoding="utf-8")) if args.analysis_overrides else None
-    if override_payload and (
-        override_payload.get("schema") != "karaokeizer-analysis-overrides/v1"
-        or override_payload.get("pass") is not True
-        or not override_payload.get("reviewer")
-        or not override_payload.get("method")
-        or not override_payload.get("reviewed_utc")
-    ):
-        parser.error("analysis overrides require schema, pass=true, reviewer, method, and reviewed_utc")
-    overrides = override_payload.get("tracks", {}) if override_payload else {}
+    try:
+        overrides = validate_analysis_overrides(override_payload, album["tracks"]) if override_payload else {}
+    except ValueError as error:
+        parser.error(str(error))
     override_hash = sha256(args.analysis_overrides) if args.analysis_overrides else None
     data_dir = output / "karaoke" / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(ssli_root, output / "karaoke" / "ssli", dirs_exist_ok=False)
+    ssli_destination = output / "karaoke" / "ssli"
+    for item in ssli_manifest["files"]:
+        source = (ssli_root / item["path"]).resolve(strict=True)
+        if not source.is_relative_to(ssli_root) or sha256(source) != item["sha256"]:
+            parser.error(f"SSLI file changed during copy: {item['path']}")
+        destination = ssli_destination / item["path"]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    shutil.copy2(ssli_root / MANIFEST_NAME, ssli_destination / MANIFEST_NAME)
+    cover_source = (media_root / "cover.jpg").resolve(strict=True)
+    if not cover_source.is_relative_to(media_root) or sha256(cover_source) != album["cover_sha256"]:
+        parser.error("packaged cover is missing or does not match the album manifest")
+    shutil.copy2(cover_source, output / "cover.jpg")
     failures = []
     player_tracks = []
     for track in album["tracks"]:
@@ -572,6 +614,7 @@ def main() -> int:
     html = build_html(output, album, player_tracks) if len(player_tracks) == len(album["tracks"]) else None
     artifact_paths = (
         ([html] if html else [])
+        + [output / "cover.jpg"]
         + sorted(data_dir.glob("*.karaoke.json"))
         + sorted((output / "media").glob("*"))
         + sorted(path for path in (output / "karaoke" / "ssli").rglob("*") if path.is_file())

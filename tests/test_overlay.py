@@ -1,4 +1,5 @@
 from karaokeizer.build_karaoke_overlay import (
+    build_html,
     filter_lyric_segments,
     note_for_midi,
     segment_timing_errors,
@@ -42,3 +43,20 @@ def test_explicit_instrumental_classification_suppresses_all_lyrics():
     )
     assert accepted == []
     assert "instrumental" in status.lower() or "reliable" in status.lower()
+
+
+def test_hum_uses_audio_context_scheduling_not_javascript_timers(tmp_path):
+    album = {"config": {"album": "Album", "artist": "Artist"}}
+    track = {
+        "title": "Song", "audio": "media/song.flac", "segments": [], "words": [], "note_events": [],
+        "detected_key": {"status": "confident", "label": "C major", "display": "C major", "confidence": 1.0,
+                         "runner_up": {}, "tonic": "C", "mode": "major"},
+        "rhythm": {"meter": {"numerator": 4, "denominator": 4}, "measures": [], "beats": []},
+        "pitch_range": {"min_midi": 36, "max_midi": 84}, "status": "instrumental",
+    }
+
+    player = build_html(tmp_path, album, [track]).read_text(encoding="utf-8")
+    assert "osc1.start(startAt)" in player
+    assert "function scheduleHumNode" in player
+    assert "guideTimers" not in player
+    assert "setTimeout(()=>" not in player

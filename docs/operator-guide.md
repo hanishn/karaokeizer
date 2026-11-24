@@ -41,10 +41,11 @@ python -m pip install --no-deps --no-build-isolation .
 python -m playwright install chromium
 ```
 
-Install FFmpeg/FFprobe separately and confirm both are on `PATH`. Demucs and
-Whisper are optional production extras and should be installed in a dedicated
-environment. For `faster-whisper`, supply an immutable model revision; the CLI
-refuses an unpinned remote model.
+Install FFmpeg/FFprobe separately and confirm both are on `PATH`. On the primary
+Windows/Python 3.12 processing platform, use
+`requirements-production-windows-py312.lock` instead of the dev lock to install
+Demucs, both Whisper backends, and browser QA with hashes. For `faster-whisper`,
+supply a full immutable 40-character model commit; mutable tags are rejected.
 
 ## Release sequence
 
@@ -64,8 +65,10 @@ repository.
    `lyric-review.json`. Each review names its reviewer and method. Separation
    rows contain the exact source/vocal/accompaniment hashes reviewed.
 6. Build into a new rendered-candidate directory. The builder copies packaged
-   audio and the supplied SSLI distribution, making the candidate preview and
-   canonical tree identical.
+   audio and the manifest-verified SSLI distribution, making the candidate
+   preview and canonical tree identical. Run `karaokeizer-manifest-ssli` on a
+   reviewed prebuilt distribution first; linked, hidden, unexpected, or
+   oversized files are rejected.
 7. Serve that candidate with `karaokeizer-serve`. Run the album and Chromium
    audits. The visual audit refuses a URL whose response bytes differ from the
    local player file and records failed browser/media requests.

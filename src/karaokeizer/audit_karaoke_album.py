@@ -257,7 +257,7 @@ def main() -> int:
     parser.add_argument("--transcripts", required=True, type=Path)
     parser.add_argument("--karaoke-data", type=Path)
     parser.add_argument(
-        "--separation-review", type=Path,
+        "--separation-review", required=True, type=Path,
         help="JSON evidence with tracks.<number>.status=pass from independent listening or leakage analysis",
     )
     parser.add_argument("--output", required=True, type=Path)
@@ -265,7 +265,17 @@ def main() -> int:
     album = json.loads(args.album_manifest.read_text(encoding="utf-8"))
     source_root = args.source_root.resolve(strict=True)
     stem_root = args.stem_root.resolve(strict=True)
-    review_payload = json.loads(args.separation_review.read_text(encoding="utf-8")) if args.separation_review else {}
+    review_payload = json.loads(args.separation_review.read_text(encoding="utf-8"))
+    expected_review_tracks = {str(int(track["number"])) for track in album["tracks"]}
+    if (
+        review_payload.get("schema") != "karaokeizer-separation-review/v1"
+        or review_payload.get("pass") is not True
+        or not review_payload.get("reviewer")
+        or not review_payload.get("method")
+        or not review_payload.get("reviewed_utc")
+        or set(review_payload.get("tracks", {})) != expected_review_tracks
+    ):
+        parser.error("separation review metadata and track inventory must exactly match the album")
     separation_reviews = review_payload.get("tracks", {})
     rows = []
     for track in album["tracks"]:
@@ -321,7 +331,7 @@ def main() -> int:
         "created_utc": datetime.now(UTC).isoformat(),
         "album_manifest": str(args.album_manifest),
         "album_manifest_sha256": sha256(args.album_manifest),
-        "separation_review_sha256": sha256(args.separation_review) if args.separation_review else None,
+        "separation_review_sha256": sha256(args.separation_review),
         "thresholds": {
             "stem_reconstruction_error_db_max": -20,
             "minimum_word_pitch_coverage": 0.80,
