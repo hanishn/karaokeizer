@@ -45,6 +45,10 @@ def main() -> int:
     parser.add_argument("--evidence-dir", required=True, type=Path)
     parser.add_argument("--samples-per-track", type=int, default=3)
     parser.add_argument(
+        "--main-thread-stall-ms", type=int, default=0,
+        help="Adversarial QA only: block the page thread after play to verify AudioWorklet pre-scheduling",
+    )
+    parser.add_argument(
         "--sample", action="append", default=[], metavar="TRACK:SECONDS",
         help="Add a known-risk sample (repeatable), for example --sample 5:166",
     )
@@ -91,15 +95,22 @@ def main() -> int:
             page.wait_for_timeout(100)
         else:
             raise ValueError("SSLI iframe did not expose SynthLab within 10 seconds")
-        guide_state = page.evaluate(
+        page.evaluate(
             """async () => {
                 const button=document.querySelector('#guide-toggle');
-                if(!button)return {present:false,enabled:false,status:'missing guide control'};
+                if(!button)return;
                 button.click();
-                await new Promise(resolve=>setTimeout(resolve,100));
-                return {present:true,enabled:button.getAttribute('aria-pressed')==='true',status:document.querySelector('#guide-status')?.textContent||''};
             }"""
         )
+        for _ in range(100):
+            if page.locator("#guide-toggle").get_attribute("aria-pressed") == "true":
+                break
+            page.wait_for_timeout(100)
+        guide_state = {
+            "present": page.locator("#guide-toggle").count() == 1,
+            "enabled": page.locator("#guide-toggle").get_attribute("aria-pressed") == "true",
+            "status": page.locator("#guide-status").inner_text(),
+        }
         inventory = page.evaluate("tracks.map((t,index)=>({index,title:t.title,noteCount:t.note_events.length,segments:t.segments.map(s=>({start:s.start,end:s.end}))}))")
         for track in inventory:
             segments = track["segments"]
@@ -150,14 +161,16 @@ def main() -> int:
                 result["mediaError"] = media_error
                 if sample_index == 1 and media_ready:
                     result["playbackAdvanced"] = page.evaluate(
-                        """async () => {
+                        """async stallMs => {
                             const before=audio.currentTime;
                             try { await audio.play(); } catch { return false; }
+                            if(stallMs>0){const until=performance.now()+stallMs;while(performance.now()<until){}}
                             await new Promise(resolve=>setTimeout(resolve,500));
                             const advanced=audio.currentTime>before+0.05;
                             audio.pause();
                             return advanced;
-                        }"""
+                        }""",
+                        args.main_thread_stall_ms,
                     )
                 else:
                     result["playbackAdvanced"] = True
@@ -179,14 +192,29 @@ def main() -> int:
             if any(not sample["playbackAdvanced"] for sample in samples):
                 failures.append("audio_playback_clock_did_not_advance")
             rows.append({"track": track["index"] + 1, "title": track["title"], "samples": samples, "failures": failures, "pass": not failures})
+        page.wait_for_timeout(100)
         guide_telemetry = page.evaluate("window.karaokeGuideTelemetry")
+        worklet_telemetry = page.locator("#ssli-engine").evaluate(
+            "frame => frame.contentWindow.SynthLab.formant.getScheduleTelemetry?.() || []"
+        )
+        worklet_states = {event.get("state") for event in worklet_telemetry}
+        timing_events = [event for event in worklet_telemetry if event.get("state") in {"started", "released"}]
+        timing_within_quantum = all(
+            abs(event.get("actualFrame", 0) - event.get("requestedFrame", 0)) <= 128 for event in timing_events
+        )
+        audible_releases = [event for event in worklet_telemetry if event.get("state") == "released" and event.get("peak", 0) > 1e-6]
         expected_guide_notes = sum(track["noteCount"] for track in inventory)
         guide_state["telemetry"] = guide_telemetry
+        guide_state["workletTelemetry"] = worklet_telemetry
         guide_state["pass"] = (
             guide_state["present"]
             and guide_state["enabled"]
             and (expected_guide_notes == 0 or guide_telemetry.get("scheduled", 0) > 0)
             and (expected_guide_notes == 0 or guide_telemetry.get("cancelled", 0) > 0)
+            and (expected_guide_notes == 0 or {"scheduled", "started", "released", "cancelled"} <= worklet_states)
+            and (expected_guide_notes == 0 or bool(timing_events))
+            and timing_within_quantum
+            and (expected_guide_notes == 0 or bool(audible_releases))
         )
         browser.close()
     report = {

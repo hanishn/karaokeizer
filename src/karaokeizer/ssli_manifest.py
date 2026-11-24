@@ -7,18 +7,20 @@ import hashlib
 import json
 import os
 import stat
+from importlib.resources import files as resource_files
 from pathlib import Path
+
+from .prepare_ssli import CAPABILITY_FILE, CAPABILITY_SCHEMA, PINNED_SSLI_COMMIT
 
 SCHEMA = "karaokeizer-ssli-distribution/v1"
 MANIFEST_NAME = "karaokeizer-ssli-manifest.json"
 ALLOWED_SUFFIXES = {
-    ".css", ".gif", ".html", ".jpeg", ".jpg", ".js", ".json", ".mp3",
+    ".css", ".gif", ".html", ".jpeg", ".jpg", ".js", ".json", ".mp3", ".txt",
     ".ogg", ".png", ".svg", ".ttf", ".wasm", ".wav", ".webp", ".woff", ".woff2",
 }
 MAX_FILES = 10_000
 MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_TOTAL_BYTES = 500 * 1024 * 1024
-REQUIRED_FORMANT_API = ("scheduleNote", "cancelSchedule")
 
 UNSAFE_WINDOWS_ATTRIBUTES = sum(
     getattr(stat, name, 0)
@@ -88,12 +90,19 @@ def distribution_files(root: Path) -> list[Path]:
                 raise ValueError("SSLI distribution exceeds file-count or total-size limit")
     if not (root / "index.html").is_file() or (root / "index.html") not in files:
         raise ValueError("SSLI distribution must contain a regular index.html")
-    index_source = (root / "index.html").read_text(encoding="utf-8", errors="replace")
-    missing_api = [name for name in REQUIRED_FORMANT_API if name not in index_source]
-    if missing_api:
-        raise ValueError(
-            "SSLI distribution lacks the timestamped formant scheduling API: " + ", ".join(missing_api)
-        )
+    capability_path = root / CAPABILITY_FILE
+    if not capability_path.is_file():
+        raise ValueError(f"SSLI distribution lacks {CAPABILITY_FILE}; run karaokeizer-prepare-ssli")
+    capability = json.loads(capability_path.read_text(encoding="utf-8"))
+    scheduler_patch = Path(str(resource_files("karaokeizer").joinpath("data/ssli-formant-scheduler.patch")))
+    if (
+        capability.get("schema") != CAPABILITY_SCHEMA
+        or capability.get("upstream_commit") != PINNED_SSLI_COMMIT
+        or capability.get("formant_scheduling_api") != 1
+        or capability.get("patch_sha256") != sha256(scheduler_patch)
+        or capability.get("index_sha256") != sha256(root / "index.html")
+    ):
+        raise ValueError("SSLI capability declaration does not bind the pinned timestamped formant build")
     return sorted(files, key=lambda path: path.relative_to(root).as_posix())
 
 
@@ -130,7 +139,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path)
     args = parser.parse_args()
-    manifest = build_manifest(args.root)
+    try:
+        manifest = build_manifest(args.root)
+    except (ValueError, OSError, json.JSONDecodeError) as error:
+        parser.error(f"cannot approve SSLI distribution at {args.root}: {error}")
     destination = args.root / MANIFEST_NAME
     destination.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(destination)

@@ -1,0 +1,238 @@
+diff --git a/shared/assets/formant-engine.js b/shared/assets/formant-engine.js
+index 4bd7339..35cb8b8 100644
+--- a/shared/assets/formant-engine.js
++++ b/shared/assets/formant-engine.js
+@@ -171,6 +171,8 @@
+   var isWorkletReadyPromise = null;
+   var formantWorkletNodes = [null, null, null, null];
+   var shouldUseFallback = false;
++  var scheduleTelemetry = [];
++  var nextScheduleEventId = 1;
+ 
+   // ScriptProcessor fallback state
+   var scriptNodes = [null, null, null, null];
+@@ -597,10 +599,9 @@
+       return Promise.reject(new Error('No AudioContext'));
+     }
+ 
+-    // Always use ScriptProcessor — synchronous, immediate, reliable.
+-    // AudioWorklet async loading causes notes to be silently dropped.
+-
+-    // Fallback to ScriptProcessorNode
++    if (audioContext.audioWorklet && typeof AudioWorkletNode !== 'undefined') {
++      return initWorklet();
++    }
+     console.warn('[FORMANT] AudioWorklet not supported, using ScriptProcessor fallback');
+     return initFallback();
+   }
+@@ -618,6 +619,9 @@
+           isEngineReady = true;
+           resolve(true);
+         }
++      } else if (event.data.type === 'scheduleTelemetry') {
++        scheduleTelemetry.push(event.data);
++        if (scheduleTelemetry.length > 10000) { scheduleTelemetry.shift(); }
+       }
+     };
+   }
+@@ -992,6 +996,66 @@
+     }
+   }
+ 
++  function scheduleNote(midi, velocity, instId, startTime, endTime, scheduleId) {
++    if (!isWorkletReady || !formantWorkletNodes[instId]) {
++      throw new Error('Timestamped formant scheduling requires the AudioWorklet engine');
++    }
++    if (!Number.isFinite(startTime) || !Number.isFinite(endTime) || endTime <= startTime) {
++      throw new Error('Invalid formant schedule times');
++    }
++    connectToOutput(instId);
++    var settings = getOrCreateSettings(instId);
++    var instruments = SL.audio.getInstruments();
++    var rawHum = instruments[instId].settings.humanization || {};
++    var adsrRaw = instruments[instId].settings.adsr || { a: 10, d: 100, s: 70, r: 200 };
++    var sliderToTime = SL.audio.sliderToTime;
++    var voiceSettings = {
++      instId: instId,
++      vowel: settings.vowel,
++      vowelTarget: settings.vowelTarget,
++      morphX: settings.morphX,
++      formantShift: settings.formantShift,
++      breathiness: settings.breathiness,
++      glottalPulseWidth: settings.glottalPulseWidth,
++      adsr: {
++        a: sliderToTime(adsrRaw.a, 500, 500) / 1000,
++        d: sliderToTime(adsrRaw.d, 500, 500) / 1000,
++        s: adsrRaw.s / 100,
++        r: sliderToTime(adsrRaw.r, 1000, 1000) / 1000
++      },
++      humVelocity: (typeof rawHum === 'number') ? rawHum : (rawHum.velocity || 0),
++      humAdsr: (typeof rawHum === 'number') ? rawHum : (rawHum.adsr || 0),
++      humTiming: 0
++    };
++    var eventId = String(scheduleId) + ':' + (nextScheduleEventId++);
++    formantWorkletNodes[instId].port.postMessage({
++      type: 'scheduleNote',
++      scheduleId: String(scheduleId),
++      eventId: eventId,
++      midiNote: midi,
++      velocity: velocity || 100,
++      noteFreq: midiToFreq(midi),
++      startFrame: Math.round(startTime * audioContext.sampleRate),
++      endFrame: Math.round(endTime * audioContext.sampleRate),
++      settings: voiceSettings
++    });
++    return eventId;
++  }
++
++  function cancelSchedule(scheduleId, instId) {
++    if (!isWorkletReady || !formantWorkletNodes[instId]) { return false; }
++    formantWorkletNodes[instId].port.postMessage({
++      type: 'cancelSchedule', scheduleId: String(scheduleId)
++    });
++    return true;
++  }
++
++  function getScheduleTelemetry(clear) {
++    var result = scheduleTelemetry.slice();
++    if (clear) { scheduleTelemetry.length = 0; }
++    return result;
++  }
++
+   // ============================================================
+   // Parameter Control
+   // ============================================================
+@@ -1135,6 +1199,10 @@
+     noteOn: noteOn,
+     noteOff: noteOff,
+     allNotesOff: allNotesOff,
++    scheduleNote: scheduleNote,
++    cancelSchedule: cancelSchedule,
++    getScheduleTelemetry: getScheduleTelemetry,
++    formantSchedulingApi: 1,
+ 
+     // Parameter control
+     setVowel: setVowel,
+diff --git a/shared/assets/worklets/formant-worklet.js b/shared/assets/worklets/formant-worklet.js
+index 95992e3..f20b037 100644
+--- a/shared/assets/worklets/formant-worklet.js
++++ b/shared/assets/worklets/formant-worklet.js
+@@ -416,6 +416,7 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
+ 
+     // Custom vowel support
+     this.customVowelData = null;
++    this.scheduledEvents = [];
+ 
+     this.port.onmessage = this.handleMessage.bind(this);
+     this.port.postMessage({ type: 'ready' });
+@@ -437,6 +438,14 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
+         this.onAllNotesOff();
+         break;
+ 
++      case 'scheduleNote':
++        this.onScheduleNote(data);
++        break;
++
++      case 'cancelSchedule':
++        this.onCancelSchedule(data.scheduleId);
++        break;
++
+       case 'updateSettings':
+         this.onUpdateSettings(data);
+         break;
+@@ -466,6 +475,10 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
+       voice = this.voices[0]; // steal oldest
+     }
+     voice.noteOn(data.midiNote, data.velocity, data.noteFreq, data.settings);
++    voice._scheduleId = data.scheduleId || null;
++    voice._eventId = data.eventId || null;
++    voice._schedulePeak = 0;
++    return voice;
+   }
+ 
+   onNoteOff(midi) {
+@@ -485,6 +498,53 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
+     }
+   }
+ 
++  onScheduleNote(data) {
++    if (!Number.isFinite(data.startFrame) || !Number.isFinite(data.endFrame) || data.endFrame <= data.startFrame) {
++      return;
++    }
++    this.scheduledEvents.push({ frame: data.startFrame, order: 1, action: 'start', data: data });
++    this.scheduledEvents.push({ frame: data.endFrame, order: 0, action: 'release', data: data });
++    this.scheduledEvents.sort(function(a, b) { return a.frame - b.frame || a.order - b.order; });
++    this.port.postMessage({
++      type: 'scheduleTelemetry', state: 'scheduled', scheduleId: data.scheduleId,
++      eventId: data.eventId, startFrame: data.startFrame, endFrame: data.endFrame
++    });
++  }
++
++  onCancelSchedule(scheduleId) {
++    var before = this.scheduledEvents.length;
++    this.scheduledEvents = this.scheduledEvents.filter(function(event) {
++      return event.data.scheduleId !== scheduleId;
++    });
++    var active = 0;
++    for (var i = 0; i < this.voices.length; i++) {
++      var voice = this.voices[i];
++      if (voice.active && voice._scheduleId === scheduleId) {
++        voice.noteOff();
++        active++;
++      }
++    }
++    this.port.postMessage({
++      type: 'scheduleTelemetry', state: 'cancelled', scheduleId: scheduleId,
++      pendingCount: before - this.scheduledEvents.length, activeCount: active, frame: currentFrame
++    });
++  }
++
++  releaseScheduledEvent(data, frame) {
++    for (var i = 0; i < this.voices.length; i++) {
++      var voice = this.voices[i];
++      if (voice.active && voice._eventId === data.eventId) {
++        voice.noteOff();
++        this.port.postMessage({
++          type: 'scheduleTelemetry', state: 'released', scheduleId: data.scheduleId,
++          eventId: data.eventId, requestedFrame: data.endFrame, actualFrame: frame,
++          peak: voice._schedulePeak || 0
++        });
++        return;
++      }
++    }
++  }
++
+   onUpdateSettings(data) {
+     if (data.vowel !== undefined) { this.vowel = data.vowel; }
+     if (data.vowelTarget !== undefined) { this.vowelTarget = data.vowelTarget; }
+@@ -561,10 +621,26 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
+     var PER_VOICE_BASE_GAIN = 0.75;
+ 
+     for (var s = 0; s < blockSize; s++) {
++      var absoluteFrame = currentFrame + s;
++      while (this.scheduledEvents.length && this.scheduledEvents[0].frame <= absoluteFrame) {
++        var scheduled = this.scheduledEvents.shift();
++        if (scheduled.action === 'start') {
++          this.onNoteOn(scheduled.data);
++          this.port.postMessage({
++            type: 'scheduleTelemetry', state: 'started', scheduleId: scheduled.data.scheduleId,
++            eventId: scheduled.data.eventId, requestedFrame: scheduled.data.startFrame,
++            actualFrame: absoluteFrame
++          });
++        } else {
++          this.releaseScheduledEvent(scheduled.data, absoluteFrame);
++        }
++      }
+       var sample = 0;
+       for (var vi2 = 0; vi2 < this.voices.length; vi2++) {
+         if (this.voices[vi2].active) {
+-          sample += this.voices[vi2].processSample() * PER_VOICE_BASE_GAIN * perVoiceGain;
++          var voiceSample = this.voices[vi2].processSample() * PER_VOICE_BASE_GAIN * perVoiceGain;
++          this.voices[vi2]._schedulePeak = Math.max(this.voices[vi2]._schedulePeak || 0, Math.abs(voiceSample));
++          sample += voiceSample;
+         }
+       }
+       // Soft clip via Pade [3,2] approximant of tanh:
+warning: in the working copy of 'shared/assets/formant-engine.js', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'shared/assets/worklets/formant-worklet.js', LF will be replaced by CRLF the next time Git touches it
+

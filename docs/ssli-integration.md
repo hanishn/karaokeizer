@@ -1,8 +1,10 @@
 # SSLI formant integration contract
 
-Karaokeizer does not bundle Super Synth Lab Instrument (SSLI). Supply a reviewed
-browser distribution and generate its exact allowlist with
-`karaokeizer-manifest-ssli`.
+Karaokeizer does not bundle Super Synth Lab Instrument (SSLI). The
+`karaokeizer-prepare-ssli` command applies the reviewed scheduler patch to the
+pinned upstream commit, builds a self-contained distribution, records a
+hash-bound capability declaration, and restores the source checkout. Generate
+the distribution's exact allowlist with `karaokeizer-manifest-ssli`.
 
 ## Required API
 
@@ -30,6 +32,7 @@ may stop in a background tab; the AudioWorklet clock does not. Rebuilding the
 schedule at each transport discontinuity preserves timing without a fragile
 two-second lookahead loop.
 
-The manifest command performs a static capability check and the player repeats
-the check at runtime. Browser QA must still exercise the guide voice because a
-matching function name alone does not prove correct audio behavior.
+The manifest binds the pinned upstream commit, scheduler-patch hash, API version,
+and built index hash. The player repeats the API check at runtime. Browser QA
+uses that real patched distribution and requires scheduled/start/release/cancel
+worklet events, render-quantum timing, and nonzero formant output energy.

@@ -38,9 +38,14 @@ jobs:
       - run: python -m pip install --require-hashes -r requirements-dev.lock
       - run: python -m pip install --no-deps --no-build-isolation .
       - run: python -m playwright install --with-deps chromium
+      - run: git clone --no-checkout https://github.com/hanishn/SuperSynthLabInstrument.git .tmp/ssli-source
+      - run: git -C .tmp/ssli-source fetch --depth 1 origin 882a1e061d75c3db95b6e63fd8ab9980102e24d4 && git -C .tmp/ssli-source checkout --detach FETCH_HEAD
+      - run: karaokeizer-prepare-ssli .tmp/ssli-source .tmp/ssli-built
+      - run: karaokeizer-manifest-ssli .tmp/ssli-built
       - run: pytest -q tests/browser
         env:
           KARAOKEIZER_BROWSER_TESTS: "1"
+          KARAOKEIZER_REAL_SSLI_ROOT: ${{ github.workspace }}/.tmp/ssli-built
 
   production-lock-windows:
     runs-on: windows-latest

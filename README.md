@@ -54,16 +54,24 @@ python -m pip install --no-deps --no-build-isolation .
 playwright install chromium
 ```
 
-On macOS or Linux, replace the activation command with
-`source .venv/bin/activate`. Install FFmpeg with your platform package manager
-(for example, `brew install ffmpeg` or `sudo apt install ffmpeg`). The remaining
-commands and manifest formats are platform-independent.
-
 The production lock targets Windows and Python 3.12, the primary supported
-processing environment. Development and CI use `requirements-dev.lock` on
-Windows and Linux. Other production platforms can select only the stages they
-need (`.[separation]`, `.[transcription]`, or `.[visual-qa]`), but that
-live-resolved path is not yet claimed as bit-for-bit reproducible.
+processing environment.
+
+For development on macOS or Linux, use the cross-platform development lock:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install --require-hashes -r requirements-dev.lock
+python -m pip install --no-deps --no-build-isolation .
+playwright install chromium
+```
+
+Install FFmpeg with the platform package manager (`brew install ffmpeg` or
+`sudo apt install ffmpeg`). Development and CI are locked on Windows and Linux.
+A full non-Windows production dependency set is not yet claimed as bit-for-bit
+reproducible; live-resolved optional groups remain available for expert use.
 
 ## First album
 
@@ -94,16 +102,21 @@ karaokeizer-audit-transcripts C:\path\to\work\transcripts\candidate-001 `
 
 5. Resolve failures according to [the QA pipeline](docs/qa-pipeline.md), then build and serve the player:
 
-First create the safety allowlist for the reviewed SSLI browser distribution.
+First build the pinned SSLI formant integration from a pristine checkout, then
+create the safety allowlist for that reviewed browser distribution:
+
+```powershell
+git clone https://github.com/hanishn/SuperSynthLabInstrument.git C:\path\to\ssli-source
+git -C C:\path\to\ssli-source checkout 882a1e061d75c3db95b6e63fd8ab9980102e24d4
+karaokeizer-prepare-ssli C:\path\to\ssli-source C:\path\to\ssli-distribution
+karaokeizer-manifest-ssli C:\path\to\ssli-distribution
+```
+
 The command rejects symlinks/junctions, hidden files, unexpected types, and
 oversized trees; rerun it whenever the distribution intentionally changes. The
 distribution must implement Karaokeizer's timestamped formant scheduling
 contract; immediate `noteOn`/timer-based releases are deliberately rejected.
 See [the SSLI integration contract](docs/ssli-integration.md).
-
-```powershell
-karaokeizer-manifest-ssli C:\path\to\ssli-distribution
-```
 
 ```powershell
 karaokeizer-build-player `

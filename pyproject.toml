@@ -56,6 +56,7 @@ karaokeizer-audit-player = "karaokeizer.audit_karaoke_player_visual:main"
 karaokeizer-serve = "karaokeizer.serve_karaoke:main"
 karaokeizer-promote = "karaokeizer.promote:main"
 karaokeizer-manifest-ssli = "karaokeizer.ssli_manifest:main"
+karaokeizer-prepare-ssli = "karaokeizer.prepare_ssli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/karaokeizer"]
