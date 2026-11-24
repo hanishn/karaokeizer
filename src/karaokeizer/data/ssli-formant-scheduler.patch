@@ -2,11 +2,13 @@ diff --git a/shared/assets/formant-engine.js b/shared/assets/formant-engine.js
 index 4bd7339..ac12d85 100644
 --- a/shared/assets/formant-engine.js
 +++ b/shared/assets/formant-engine.js
-@@ -171,6 +171,8 @@
+@@ -171,6 +171,10 @@
    var isWorkletReadyPromise = null;
    var formantWorkletNodes = [null, null, null, null];
    var shouldUseFallback = false;
 +  var scheduleTelemetry = [];
++  var scheduleTelemetryStart = 0;
++  var scheduleTelemetryLimit = 40000;
 +  var nextScheduleEventId = 1;
  
    // ScriptProcessor fallback state
@@ -25,17 +27,21 @@ index 4bd7339..ac12d85 100644
      console.warn('[FORMANT] AudioWorklet not supported, using ScriptProcessor fallback');
      return initFallback();
    }
-@@ -618,6 +619,9 @@
+@@ -618,6 +621,13 @@
            isEngineReady = true;
            resolve(true);
          }
 +      } else if (event.data.type === 'scheduleTelemetry') {
-+        scheduleTelemetry.push(event.data);
-+        if (scheduleTelemetry.length > 40000) { scheduleTelemetry.shift(); }
++        if (scheduleTelemetry.length < scheduleTelemetryLimit) {
++          scheduleTelemetry.push(event.data);
++        } else {
++          scheduleTelemetry[scheduleTelemetryStart] = event.data;
++          scheduleTelemetryStart = (scheduleTelemetryStart + 1) % scheduleTelemetryLimit;
++        }
        }
      };
    }
-@@ -992,6 +996,84 @@
+@@ -992,6 +1001,88 @@
      }
    }
  
@@ -112,15 +118,19 @@ index 4bd7339..ac12d85 100644
 +  }
 +
 +  function getScheduleTelemetry(clear) {
-+    var result = scheduleTelemetry.slice();
-+    if (clear) { scheduleTelemetry.length = 0; }
++    var result = scheduleTelemetryStart === 0 ? scheduleTelemetry.slice() :
++      scheduleTelemetry.slice(scheduleTelemetryStart).concat(scheduleTelemetry.slice(0, scheduleTelemetryStart));
++    if (clear) {
++      scheduleTelemetry.length = 0;
++      scheduleTelemetryStart = 0;
++    }
 +    return result;
 +  }
 +
    // ============================================================
    // Parameter Control
    // ============================================================
-@@ -1135,6 +1217,11 @@
+@@ -1135,6 +1227,11 @@
      noteOn: noteOn,
      noteOff: noteOff,
      allNotesOff: allNotesOff,
@@ -257,7 +267,7 @@ index 95992e3..33727db 100644
    onUpdateSettings(data) {
      if (data.vowel !== undefined) { this.vowel = data.vowel; }
      if (data.vowelTarget !== undefined) { this.vowelTarget = data.vowelTarget; }
-@@ -561,10 +654,31 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
+@@ -561,10 +654,27 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
      var PER_VOICE_BASE_GAIN = 0.75;
  
      for (var s = 0; s < blockSize; s++) {
@@ -276,10 +286,6 @@ index 95992e3..33727db 100644
 +          this.releaseScheduledEvent(scheduled.data, absoluteFrame);
 +        }
 +      }
-+      if (this.scheduledEventIndex === this.scheduledEvents.length) {
-+        this.scheduledEvents = [];
-+        this.scheduledEventIndex = 0;
-+      }
        var sample = 0;
        for (var vi2 = 0; vi2 < this.voices.length; vi2++) {
          if (this.voices[vi2].active) {
@@ -290,3 +296,14 @@ index 95992e3..33727db 100644
          }
        }
        // Soft clip via Pade [3,2] approximant of tanh:
+@@ -575,6 +688,10 @@ class FormantWorkletProcessor extends AudioWorkletProcessor {
+       // Apply output boost
+       channel[s] = clipped * FORMANT_OUTPUT_BOOST;
+     }
++    if (this.scheduledEvents.length && this.scheduledEventIndex === this.scheduledEvents.length) {
++      this.scheduledEvents = [];
++      this.scheduledEventIndex = 0;
++    }
+ 
+     return true;
+   }
